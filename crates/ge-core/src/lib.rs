@@ -296,6 +296,7 @@ mod tests {
     struct LastMeshSink {
         frames: usize,
         depths: usize,
+        poses: usize,
         meshes: Vec<MeshPacket>,
     }
 
@@ -307,6 +308,11 @@ mod tests {
 
         fn on_depth(&mut self, _frame: &FramePacket, _depth: &DepthPacket) -> anyhow::Result<()> {
             self.depths += 1;
+            Ok(())
+        }
+
+        fn on_pose(&mut self, _frame: &FramePacket, _pose: &PosePacket) -> anyhow::Result<()> {
+            self.poses += 1;
             Ok(())
         }
 
@@ -339,6 +345,7 @@ mod tests {
         let mut sink = LastMeshSink {
             frames: 0,
             depths: 0,
+            poses: 0,
             meshes: Vec::new(),
         };
         let config = FusionConfig {
@@ -352,8 +359,36 @@ mod tests {
         assert_eq!(processed, 2);
         assert_eq!(sink.frames, 2);
         assert_eq!(sink.depths, 2);
+        assert_eq!(sink.poses, 2);
         assert_eq!(sink.meshes.len(), 2);
         assert!(sink.meshes.last().unwrap().mesh.vertex_count() > 0);
+    }
+
+    #[test]
+    fn fusion_runner_uses_supplied_pose_estimator() {
+        let mut source = ge_camera_like_source(2, 32, 32);
+        let mut depth = ConstantDepthForTest(2.5);
+        let mut pose = CountingPoseEstimator::default();
+        let mut sink = LastMeshSink {
+            frames: 0,
+            depths: 0,
+            poses: 0,
+            meshes: Vec::new(),
+        };
+        let config = FusionConfig {
+            voxel_size_m: 0.15,
+            truncation_m: 0.45,
+            mesh_every_n: 2,
+            ..FusionConfig::default()
+        };
+
+        let processed =
+            run_fusion_with_pose_sync(&mut source, &mut depth, &mut pose, config, &mut sink)
+                .unwrap();
+        assert_eq!(processed, 2);
+        assert_eq!(pose.calls, 2);
+        assert_eq!(sink.poses, 2);
+        assert_eq!(sink.meshes.len(), 1);
     }
 
     #[test]
@@ -363,6 +398,7 @@ mod tests {
         let mut sink = LastMeshSink {
             frames: 0,
             depths: 0,
+            poses: 0,
             meshes: Vec::new(),
         };
         let err = run_fusion_sync(&mut source, &mut depth, FusionConfig::default(), &mut sink)
@@ -384,6 +420,18 @@ mod tests {
                 height: frame.height,
                 depth_m: vec![self.0; frame.pixel_count()],
             })
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingPoseEstimator {
+        calls: usize,
+    }
+
+    impl PoseEstimator for CountingPoseEstimator {
+        fn track(&mut self, _frame: &Frame, _depth: &DepthMap) -> anyhow::Result<Pose> {
+            self.calls += 1;
+            Ok(Pose::IDENTITY)
         }
     }
 

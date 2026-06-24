@@ -33,6 +33,9 @@ struct RunArgs {
     /// Number of synthetic frames to process.
     #[arg(long, default_value_t = 30)]
     frames: u32,
+    /// Optional PNG/JPEG image to replay as the capture source.
+    #[arg(long)]
+    image: Option<String>,
     /// Synthetic frame width.
     #[arg(long, default_value_t = 640)]
     width: u32,
@@ -150,19 +153,23 @@ fn cmd_demo_mesh(args: DemoMeshArgs) -> anyhow::Result<()> {
 }
 
 fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
-    let mut source =
-        ge_camera::SolidColorSource::new(args.width, args.height, args.frames, [60, 120, 200]);
     let mut depth = ge_depth::ConstantDepth::new(2.5);
 
     let mut depth_acc = 0.0f64;
-    let processed = run_sync(&mut source, &mut depth, |_frame, dm| {
-        depth_acc += dm.depth_m.first().copied().unwrap_or(0.0) as f64;
-    })?;
+    let processed = if let Some(path) = args.image.as_deref() {
+        let mut source = ge_camera::ImageFileSource::open(path, args.frames)?;
+        run_sync(&mut source, &mut depth, |_frame, dm| {
+            depth_acc += dm.depth_m.first().copied().unwrap_or(0.0) as f64;
+        })?
+    } else {
+        let mut source =
+            ge_camera::SolidColorSource::new(args.width, args.height, args.frames, [60, 120, 200]);
+        run_sync(&mut source, &mut depth, |_frame, dm| {
+            depth_acc += dm.depth_m.first().copied().unwrap_or(0.0) as f64;
+        })?
+    };
 
-    println!(
-        "gods-eye M0 spine: processed {processed} frame(s) at {}x{} (depth backend: constant)",
-        args.width, args.height
-    );
+    println!("gods-eye M0 spine: processed {processed} frame(s) (depth backend: constant)");
     let _ = depth_acc;
     Ok(())
 }

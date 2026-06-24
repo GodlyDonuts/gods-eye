@@ -10,3 +10,4 @@ authors.workspace = true
 [dependencies]
 ge-backend-trait.workspace = true
 anyhow.workspace = true
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }

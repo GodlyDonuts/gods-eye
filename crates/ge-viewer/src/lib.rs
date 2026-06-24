@@ -381,8 +381,10 @@ impl WebcamSource {
         use nokhwa::utils::{CameraIndex, RequestedFormat, RequestedFormatType};
         use nokhwa::Camera;
 
+        // Highest resolution gives the camera's native (widest) field of view;
+        // high-frame-rate modes are often center-cropped, which looks zoomed in.
         let requested =
-            RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
+            RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestResolution);
         let mut camera = Camera::new(CameraIndex::Index(index), requested)
             .map_err(|e| anyhow::anyhow!("open camera {index}: {e}"))?;
         camera

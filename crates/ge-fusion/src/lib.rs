@@ -83,6 +83,17 @@ impl Tsdf {
         self.weight.iter().filter(|&&w| w > 0.0).count()
     }
 
+    /// Read-only TSDF values, exposed for CPU/GPU parity tests and future
+    /// backend implementations.
+    pub fn tsdf_values(&self) -> &[f32] {
+        &self.tsdf
+    }
+
+    /// Read-only integration weights.
+    pub fn weights(&self) -> &[f32] {
+        &self.weight
+    }
+
     /// Integrate one depth frame, given its camera intrinsics and the
     /// camera-to-world pose (projective TSDF integration).
     pub fn integrate(&mut self, depth: &DepthMap, intr: &Intrinsics, cam_to_world: &Pose) {
@@ -141,6 +152,288 @@ impl Tsdf {
             p[2] = self.origin.z + p[2] * self.voxel_size;
         }
         mesh
+    }
+}
+
+#[cfg(feature = "gpu")]
+pub mod gpu {
+    use super::Tsdf;
+    use bytemuck::{Pod, Zeroable};
+    use ge_backend_trait::{DepthMap, Intrinsics, Pose};
+    use std::sync::mpsc;
+    use wgpu::util::DeviceExt;
+
+    const WORKGROUP_SIZE: u32 = 256;
+
+    /// Dense `wgpu` TSDF integrator.
+    ///
+    /// This is the first GPU backend step: it mirrors the CPU dense-grid
+    /// reference path and copies the updated buffers back into [`Tsdf`] after
+    /// each dispatch. Keeping CPU and GPU on the same data model gives us a
+    /// correctness oracle before moving to resident sparse GPU blocks.
+    pub struct WgpuTsdfIntegrator {
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        pipeline: wgpu::ComputePipeline,
+        layout: wgpu::BindGroupLayout,
+    }
+
+    impl WgpuTsdfIntegrator {
+        pub fn new() -> anyhow::Result<Self> {
+            pollster::block_on(Self::new_async())
+        }
+
+        pub async fn new_async() -> anyhow::Result<Self> {
+            let instance = wgpu::Instance::default();
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    compatible_surface: None,
+                    force_fallback_adapter: false,
+                })
+                .await?;
+            let (device, queue) = adapter
+                .request_device(&wgpu::DeviceDescriptor {
+                    label: Some("ge-fusion device"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::default(),
+                    experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                    memory_hints: wgpu::MemoryHints::Performance,
+                    trace: wgpu::Trace::Off,
+                })
+                .await?;
+
+            let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("tsdf integrate bind group layout"),
+                entries: &[
+                    storage_entry(0, false),
+                    storage_entry(1, false),
+                    storage_entry(2, true),
+                    storage_entry(3, true),
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("tsdf integrate shader"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("shaders/tsdf_integrate.wgsl").into(),
+                ),
+            });
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("tsdf integrate pipeline layout"),
+                bind_group_layouts: &[Some(&layout)],
+                immediate_size: 0,
+            });
+            let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("tsdf integrate pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+
+            Ok(Self {
+                device,
+                queue,
+                pipeline,
+                layout,
+            })
+        }
+
+        pub fn integrate(
+            &self,
+            tsdf: &mut Tsdf,
+            depth: &DepthMap,
+            intr: &Intrinsics,
+            cam_to_world: &Pose,
+        ) -> anyhow::Result<()> {
+            anyhow::ensure!(
+                depth.depth_m.len() == depth.width as usize * depth.height as usize,
+                "depth buffer length does not match dimensions"
+            );
+            if let Some(confidence) = &depth.confidence {
+                anyhow::ensure!(
+                    confidence.len() == depth.depth_m.len(),
+                    "confidence buffer length does not match depth"
+                );
+            }
+
+            let total = tsdf.voxel_count() as u32;
+            let tsdf_buffer = self.storage_buffer("tsdf", &tsdf.tsdf);
+            let weight_buffer = self.storage_buffer("weight", &tsdf.weight);
+            let depth_buffer = self.storage_buffer("depth", &depth.depth_m);
+            let confidence_storage;
+            let confidence_slice: &[f32] = if let Some(confidence) = &depth.confidence {
+                confidence
+            } else {
+                confidence_storage = vec![1.0f32];
+                &confidence_storage
+            };
+            let confidence_buffer = self.storage_buffer("confidence", confidence_slice);
+            let params = GpuParams::new(tsdf, depth, intr, cam_to_world);
+            let params_buffer = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("tsdf params"),
+                    contents: bytemuck::bytes_of(&params),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("tsdf integrate bind group"),
+                layout: &self.layout,
+                entries: &[
+                    bind_entry(0, &tsdf_buffer),
+                    bind_entry(1, &weight_buffer),
+                    bind_entry(2, &depth_buffer),
+                    bind_entry(3, &confidence_buffer),
+                    bind_entry(4, &params_buffer),
+                ],
+            });
+
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("tsdf integrate encoder"),
+                });
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("tsdf integrate pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(total.div_ceil(WORKGROUP_SIZE), 1, 1);
+            }
+            self.queue.submit(Some(encoder.finish()));
+
+            tsdf.tsdf = self.read_f32_buffer(&tsdf_buffer, tsdf.tsdf.len())?;
+            tsdf.weight = self.read_f32_buffer(&weight_buffer, tsdf.weight.len())?;
+            Ok(())
+        }
+
+        fn storage_buffer(&self, label: &str, data: &[f32]) -> wgpu::Buffer {
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(label),
+                    contents: bytemuck::cast_slice(data),
+                    usage: wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::COPY_DST
+                        | wgpu::BufferUsages::COPY_SRC,
+                })
+        }
+
+        fn read_f32_buffer(&self, buffer: &wgpu::Buffer, len: usize) -> anyhow::Result<Vec<f32>> {
+            let slice = buffer.slice(..);
+            let (tx, rx) = mpsc::sync_channel(1);
+            wgpu::util::DownloadBuffer::read_buffer(&self.device, &self.queue, &slice, move |r| {
+                let _ = tx.send(r.map(|b| bytemuck::cast_slice::<u8, f32>(&b).to_vec()));
+            });
+            self.device.poll(wgpu::PollType::wait_indefinitely())?;
+            let out = rx.recv()??;
+            anyhow::ensure!(out.len() == len, "downloaded buffer length mismatch");
+            Ok(out)
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Pod, Zeroable)]
+    struct GpuParams {
+        dims: [u32; 4],
+        depth_size: [u32; 4],
+        origin: [f32; 4],
+        intrinsics: [f32; 4],
+        scalars: [f32; 4],
+        world_to_cam: [f32; 16],
+    }
+
+    impl GpuParams {
+        fn new(tsdf: &Tsdf, depth: &DepthMap, intr: &Intrinsics, cam_to_world: &Pose) -> Self {
+            let world_to_cam = cam_to_world.inverse();
+            Self {
+                dims: [
+                    tsdf.dims[0],
+                    tsdf.dims[1],
+                    tsdf.dims[2],
+                    tsdf.voxel_count() as u32,
+                ],
+                depth_size: [
+                    depth.width,
+                    depth.height,
+                    u32::from(depth.confidence.is_some()),
+                    0,
+                ],
+                origin: [tsdf.origin.x, tsdf.origin.y, tsdf.origin.z, 0.0],
+                intrinsics: [intr.fx, intr.fy, intr.cx, intr.cy],
+                scalars: [tsdf.voxel_size, tsdf.trunc, 0.0, 0.0],
+                world_to_cam: glam::Mat4::from(world_to_cam).to_cols_array(),
+            }
+        }
+    }
+
+    fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
+        wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }
+    }
+
+    fn bind_entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
+        wgpu::BindGroupEntry {
+            binding,
+            resource: buffer.as_entire_binding(),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::scenes;
+
+        #[test]
+        fn gpu_integrator_matches_cpu_on_wall_scene() {
+            let integrator = match WgpuTsdfIntegrator::new() {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("skipping GPU parity test: {e}");
+                    return;
+                }
+            };
+            let (depth, intr) = scenes::wall_with_panel(32);
+            let dims = [32, 32, 24];
+            let voxel = 0.08;
+            let origin = [-1.3, -1.3, 1.2];
+            let trunc = 4.0 * voxel;
+            let mut cpu = Tsdf::new(dims, voxel, origin, trunc);
+            cpu.integrate(&depth, &intr, &Pose::IDENTITY);
+            let mut gpu = Tsdf::new(dims, voxel, origin, trunc);
+            integrator
+                .integrate(&mut gpu, &depth, &intr, &Pose::IDENTITY)
+                .unwrap();
+
+            assert_eq!(cpu.voxel_count(), gpu.voxel_count());
+            for (a, b) in cpu.tsdf_values().iter().zip(gpu.tsdf_values()) {
+                assert!((a - b).abs() < 1e-4, "tsdf mismatch: cpu={a} gpu={b}");
+            }
+            for (a, b) in cpu.weights().iter().zip(gpu.weights()) {
+                assert!((a - b).abs() < 1e-4, "weight mismatch: cpu={a} gpu={b}");
+            }
+        }
     }
 }
 

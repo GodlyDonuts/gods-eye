@@ -7,8 +7,15 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+gpu = ["dep:bytemuck", "dep:pollster", "dep:wgpu"]
+
 [dependencies]
 ge-backend-trait.workspace = true
 ge-mesh.workspace = true
 glam.workspace = true
 anyhow.workspace = true
+bytemuck = { version = "1", features = ["derive"], optional = true }
+pollster = { version = "0.4", optional = true }
+wgpu = { version = "29.0.3", optional = true }

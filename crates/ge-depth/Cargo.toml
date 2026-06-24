@@ -1,12 +1,22 @@
 [package]
 name = "ge-depth"
-description = "Metric-depth backends. ConstantDepth now; ort/DAv2 (CoreML/CUDA/CPU) in the M0 spike."
+description = "Metric-depth backends. ConstantDepth by default; ort/DAv2 (CoreML/CPU) behind the `onnx` feature."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+# Pulls in ONNX Runtime (downloads a prebuilt binary; no cmake) + the OrtDepth
+# backend and latency benchmark. Kept off by default so the core workspace build
+# and CI stay fast and dependency-light.
+onnx = ["dep:ort"]
+# Apple CoreML execution provider (macOS). Implies `onnx`.
+coreml = ["onnx", "ort/coreml"]
+
 [dependencies]
 ge-backend-trait.workspace = true
 anyhow.workspace = true
+ort = { version = "=2.0.0-rc.12", optional = true }

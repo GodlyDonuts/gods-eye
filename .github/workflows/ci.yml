@@ -36,7 +36,7 @@ jobs:
       - name: Test
         run: cargo test --workspace
       - name: Smoke-run the M0 spine (headless)
-        run: cargo run -p ge-cli -- --frames 10
+        run: cargo run -p ge-cli -- run --frames 10
 
   # License / supply-chain gate.
   deny:

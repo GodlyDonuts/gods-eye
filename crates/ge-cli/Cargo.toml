@@ -11,6 +11,13 @@ authors.workspace = true
 name = "gods-eye"
 path = "src/main.rs"
 
+[features]
+default = []
+# Enable the `bench-depth` subcommand (pulls ONNX Runtime via ge-depth).
+onnx = ["ge-depth/onnx"]
+# Apple CoreML acceleration for `bench-depth`. Implies `onnx`.
+coreml = ["onnx", "ge-depth/coreml"]
+
 [dependencies]
 ge-backend-trait.workspace = true
 ge-core.workspace = true

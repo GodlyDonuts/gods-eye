@@ -1,0 +1,12 @@
+[package]
+name = "ge-viewer"
+description = "Live mesh viewer trait. NullViewer now; rerun (dev) + three-d/egui (shipped) later."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ge-mesh.workspace = true
+anyhow.workspace = true

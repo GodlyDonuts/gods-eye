@@ -1,0 +1,22 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# Downloaded model weights (fetched at first run; never committed)
+/models/
+*.onnx
+*.mlpackage
+*.mlmodelc
+
+# Recorded test/eval media (large; keep out of git)
+/data/
+*.mp4
+*.mov
+*.mkv
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/

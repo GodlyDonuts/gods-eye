@@ -1,0 +1,12 @@
+[package]
+name = "ge-depth"
+description = "Metric-depth backends. ConstantDepth now; ort/DAv2 (CoreML/CUDA/CPU) in the M0 spike."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ge-backend-trait.workspace = true
+anyhow.workspace = true

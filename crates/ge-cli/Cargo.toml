@@ -1,0 +1,22 @@
+[package]
+name = "ge-cli"
+description = "Gods Eye command-line binary: wires the pipeline and runs it."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "gods-eye"
+path = "src/main.rs"
+
+[dependencies]
+ge-backend-trait.workspace = true
+ge-core.workspace = true
+ge-camera.workspace = true
+ge-depth.workspace = true
+ge-mesh.workspace = true
+ge-viewer.workspace = true
+clap.workspace = true
+anyhow.workspace = true

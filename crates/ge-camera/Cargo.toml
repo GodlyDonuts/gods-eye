@@ -1,0 +1,12 @@
+[package]
+name = "ge-camera"
+description = "CaptureSource implementations (synthetic/file now; nokhwa webcam + drone later)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ge-backend-trait.workspace = true
+anyhow.workspace = true

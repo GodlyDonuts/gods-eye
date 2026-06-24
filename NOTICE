@@ -1,0 +1,30 @@
+Gods Eye
+Copyright 2026 Gods Eye contributors
+
+This product is licensed under either of MIT (LICENSE-MIT) or Apache-2.0
+(LICENSE-APACHE) at your option.
+
+================================================================================
+Third-party model weights
+================================================================================
+
+Gods Eye downloads neural-network weights at first run; they are NOT bundled in
+this repository and carry their own licenses. Each must be reviewed before
+redistribution.
+
+- Depth Anything V2 — Metric, Small (ViT-S)
+  Upstream: https://github.com/DepthAnything/Depth-Anything-V2
+  Code + Small-tier weights: Apache-2.0.
+  CAVEAT (do not assert away): upstream issue #320 flags unresolved training-
+  data provenance (e.g. Hypersim / Virtual KITTI dataset terms) for commercial
+  use. Gods Eye treats these weights as "permissive label, unverified data
+  provenance." A clean-provenance replacement is a tracked goal; the runtime
+  exposes `--model-path` so a cleared-weights checkpoint can be swapped in.
+  NOTE: only the *Small* tier is Apache-2.0. The Base/Large/Giant tiers and the
+  larger metric checkpoints are CC-BY-NC-4.0 and are NOT shipped or supported.
+
+Reference-only models (NOT shipped — non-commercial / research licenses; used,
+if at all, solely as offline evaluation ground truth):
+  - Apple Depth Pro (apple-amlr, research-only)
+  - UniDepth V2 (CC-BY-NC-4.0)
+  - Metric3D V2 (BSD, non-commercial)

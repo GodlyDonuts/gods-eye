@@ -1,0 +1,13 @@
+[package]
+name = "ge-py"
+description = "Optional offline tooling bindings (pyo3/maturin). Never on the real-time path."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+# pyo3 bindings are added behind a feature later, so the default workspace build
+# needs no Python toolchain. This is an empty placeholder for now.
+[dependencies]

@@ -1,0 +1,12 @@
+[package]
+name = "ge-backend-trait"
+description = "Shared traits and core data types for the Gods Eye pipeline stages."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+glam.workspace = true
+anyhow.workspace = true

@@ -1,0 +1,36 @@
+# Gods Eye — workspace root.
+# Real-time monocular triangle-mesh reconstruction. See docs/design/ARCHITECTURE.md.
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.96"
+license = "MIT OR Apache-2.0"
+authors = ["Gods Eye contributors"]
+
+# Pinned shared dependencies. Heavy stage deps (wgpu, ort, nokhwa, rerun,
+# meshopt) are added to their crates as each stage is implemented, so the
+# scaffold stays fast to build and the CI matrix stays green with no cmake.
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+glam = "0.29"
+crossbeam-channel = "0.5"
+clap = { version = "4", features = ["derive"] }
+
+# Workspace crates depend on each other through these.
+ge-backend-trait = { path = "crates/ge-backend-trait" }
+ge-core = { path = "crates/ge-core" }
+ge-camera = { path = "crates/ge-camera" }
+ge-depth = { path = "crates/ge-depth" }
+ge-slam = { path = "crates/ge-slam" }
+ge-fusion = { path = "crates/ge-fusion" }
+ge-mesh = { path = "crates/ge-mesh" }
+ge-viewer = { path = "crates/ge-viewer" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

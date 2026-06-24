@@ -903,6 +903,7 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "ge-backend-trait",
+ "ge-depth",
  "ge-mesh",
  "nokhwa",
  "three-d",

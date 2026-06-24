@@ -220,6 +220,128 @@ pub fn view_mesh(mesh: &Mesh, title: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Open a 3D window that shows a *live* mesh: `produce` is called every frame
+/// and, whenever it returns a mesh, the displayed geometry is replaced. Orbit
+/// to look around; the camera auto-frames the first mesh. Requires the `window`
+/// feature.
+#[cfg(feature = "window")]
+pub fn view_meshes<F>(mut produce: F, title: &str) -> anyhow::Result<()>
+where
+    F: FnMut() -> anyhow::Result<Option<Mesh>> + 'static,
+{
+    use three_d::{
+        degrees, vec3, AmbientLight, Camera, ClearState, CpuMaterial, CpuMesh, Cull,
+        DirectionalLight, FrameOutput, Gm, Indices, Light, OrbitControl, PhysicalMaterial,
+        Positions, Srgba, Vec3, Window, WindowSettings,
+    };
+
+    let window = Window::new(WindowSettings {
+        title: title.to_string(),
+        max_size: Some((1280, 720)),
+        ..Default::default()
+    })
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let context = window.gl();
+
+    let mut camera = Camera::new_perspective(
+        window.viewport(),
+        vec3(0.0, 0.0, -3.0),
+        vec3(0.0, 0.0, 1.0),
+        vec3(0.0, -1.0, 0.0),
+        degrees(50.0),
+        0.05,
+        100.0,
+    );
+    let mut control = OrbitControl::new(vec3(0.0, 0.0, 1.0), 0.05, 100.0);
+    let light = DirectionalLight::new(&context, 2.0, Srgba::WHITE, vec3(-0.4, -1.0, -0.6));
+    let ambient = AmbientLight::new(&context, 0.6, Srgba::WHITE);
+
+    let mut model: Option<Gm<three_d::Mesh, PhysicalMaterial>> = None;
+    let mut framed = false;
+
+    window.render_loop(move |mut frame_input| {
+        if let Ok(Some(mesh)) = produce() {
+            if !mesh.positions.is_empty() {
+                let positions: Vec<Vec3> = mesh
+                    .positions
+                    .iter()
+                    .map(|p| vec3(p[0], p[1], p[2]))
+                    .collect();
+                let mut cpu = CpuMesh {
+                    positions: Positions::F32(positions),
+                    indices: Indices::U32(mesh.indices.clone()),
+                    ..Default::default()
+                };
+                if mesh.normals.len() == mesh.positions.len() {
+                    cpu.normals = Some(
+                        mesh.normals
+                            .iter()
+                            .map(|n| vec3(n[0], n[1], n[2]))
+                            .collect(),
+                    );
+                } else {
+                    cpu.compute_normals();
+                }
+                let mut material = PhysicalMaterial::new_opaque(
+                    &context,
+                    &CpuMaterial {
+                        albedo: Srgba::new(180, 185, 195, 255),
+                        roughness: 0.8,
+                        metallic: 0.0,
+                        ..Default::default()
+                    },
+                );
+                // Show both faces: a depth surface's winding may face either way.
+                material.render_states.cull = Cull::None;
+                model = Some(Gm::new(three_d::Mesh::new(&context, &cpu), material));
+
+                if !framed {
+                    let mut mn = [f32::MAX; 3];
+                    let mut mx = [f32::MIN; 3];
+                    for p in &mesh.positions {
+                        for i in 0..3 {
+                            mn[i] = mn[i].min(p[i]);
+                            mx[i] = mx[i].max(p[i]);
+                        }
+                    }
+                    let center = vec3(
+                        (mn[0] + mx[0]) * 0.5,
+                        (mn[1] + mx[1]) * 0.5,
+                        (mn[2] + mx[2]) * 0.5,
+                    );
+                    let (dx, dy, dz) = (mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]);
+                    let ext = (dx * dx + dy * dy + dz * dz).sqrt().max(0.2);
+                    camera = Camera::new_perspective(
+                        frame_input.viewport,
+                        center + vec3(0.0, 0.0, -ext * 1.2),
+                        center,
+                        vec3(0.0, -1.0, 0.0),
+                        degrees(50.0),
+                        ext * 0.01,
+                        ext * 20.0,
+                    );
+                    control = OrbitControl::new(center, ext * 0.03, ext * 10.0);
+                    framed = true;
+                }
+            }
+        }
+
+        camera.set_viewport(frame_input.viewport);
+        control.handle_events(&mut camera, &mut frame_input.events);
+        frame_input
+            .screen()
+            .clear(ClearState::color_and_depth(0.08, 0.09, 0.11, 1.0, 1.0))
+            .render(
+                &camera,
+                model.as_ref(),
+                &[&light as &dyn Light, &ambient as &dyn Light],
+            );
+        FrameOutput::default()
+    });
+
+    Ok(())
+}
+
 /// Open a window that displays a live RGB frame stream from any capture source
 /// (webcam, image file, synthetic). Blocks until the window is closed.
 /// Requires the `window` feature.

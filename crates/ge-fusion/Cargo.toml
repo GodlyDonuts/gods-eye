@@ -1,6 +1,6 @@
 [package]
 name = "ge-fusion"
-description = "Sparse voxel-hashed TSDF fusion. wgpu/WGSL compute kernels land incrementally."
+description = "Sparse voxel-hashed TSDF fusion. Dense CPU grid now; wgpu/WGSL compute kernels next."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,5 +8,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+ge-backend-trait.workspace = true
+ge-mesh.workspace = true
 glam.workspace = true
 anyhow.workspace = true

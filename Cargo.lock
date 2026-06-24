@@ -270,6 +270,7 @@ dependencies = [
  "ge-camera",
  "ge-core",
  "ge-depth",
+ "ge-fusion",
  "ge-mesh",
  "ge-viewer",
 ]
@@ -297,6 +298,8 @@ name = "ge-fusion"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "ge-backend-trait",
+ "ge-mesh",
  "glam",
 ]
 

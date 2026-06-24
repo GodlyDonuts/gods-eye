@@ -24,6 +24,8 @@ enum Command {
     BenchDepth(BenchArgs),
     /// Extract a triangle mesh from a synthetic SDF and write it to PLY.
     DemoMesh(DemoMeshArgs),
+    /// Reconstruct a mesh from a depth map via TSDF fusion (synthetic scene).
+    Reconstruct(ReconstructArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -74,7 +76,60 @@ fn main() -> anyhow::Result<()> {
         Command::Run(args) => cmd_run(args),
         Command::BenchDepth(args) => cmd_bench_depth(args),
         Command::DemoMesh(args) => cmd_demo_mesh(args),
+        Command::Reconstruct(args) => cmd_reconstruct(args),
     }
+}
+
+#[derive(clap::Args, Debug)]
+struct ReconstructArgs {
+    /// Synthetic input image/depth size (square).
+    #[arg(long, default_value_t = 256)]
+    size: u32,
+    /// Voxel edge length in metres.
+    #[arg(long, default_value_t = 0.02)]
+    voxel: f32,
+    /// Output PLY path.
+    #[arg(long, default_value = "out/reconstruct.ply")]
+    out: String,
+}
+
+fn cmd_reconstruct(args: ReconstructArgs) -> anyhow::Result<()> {
+    // Synthetic "wall with a raised panel" scene + matching intrinsics.
+    let (depth, intr) = ge_fusion::scenes::wall_with_panel(args.size);
+
+    // Size a volume that brackets the scene's depth range and frustum.
+    let (zmin, zmax) = (1.2f32, 2.9f32);
+    let margin = 0.15f32;
+    let half_w = (intr.width as f32 * 0.5) / intr.fx * zmax + margin;
+    let half_h = (intr.height as f32 * 0.5) / intr.fy * zmax + margin;
+    let origin = [-half_w, -half_h, zmin];
+    let voxel = args.voxel;
+    let dims = [
+        ((2.0 * half_w) / voxel).ceil() as u32,
+        ((2.0 * half_h) / voxel).ceil() as u32,
+        ((zmax - zmin) / voxel).ceil() as u32,
+    ];
+
+    let mut tsdf = ge_fusion::Tsdf::new(dims, voxel, origin, 4.0 * voxel);
+    tsdf.integrate(&depth, &intr, &ge_backend_trait::Pose::IDENTITY);
+    let mesh = tsdf.extract_mesh();
+
+    let path = std::path::Path::new(&args.out);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    mesh.write_ply(path)?;
+
+    println!(
+        "reconstructed {} — volume {:?} = {} voxels ({} observed) -> {} verts, {} tris",
+        args.out,
+        dims,
+        tsdf.voxel_count(),
+        tsdf.observed_voxels(),
+        mesh.vertex_count(),
+        mesh.triangle_count(),
+    );
+    Ok(())
 }
 
 fn cmd_demo_mesh(args: DemoMeshArgs) -> anyhow::Result<()> {

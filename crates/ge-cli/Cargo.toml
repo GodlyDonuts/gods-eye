@@ -23,6 +23,7 @@ ge-backend-trait.workspace = true
 ge-core.workspace = true
 ge-camera.workspace = true
 ge-depth.workspace = true
+ge-fusion.workspace = true
 ge-mesh.workspace = true
 ge-viewer.workspace = true
 clap.workspace = true

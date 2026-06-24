@@ -12,6 +12,9 @@
 use std::io::Write;
 use std::path::Path;
 
+use fast_surface_nets::ndshape::{RuntimeShape, Shape};
+use fast_surface_nets::{surface_nets, SurfaceNetsBuffer};
+
 /// A triangle mesh handed to the viewer. Positions/normals are world-space.
 #[derive(Clone, Default)]
 pub struct Mesh {
@@ -77,38 +80,58 @@ impl Mesh {
     }
 }
 
+/// Extract a triangle mesh from a dense signed-distance grid (negative inside,
+/// positive outside; surface at zero) of arbitrary runtime `dims` via the
+/// portable surface-nets CPU mesher. Vertex positions are in voxel-index space;
+/// the caller applies any world transform.
+pub fn surface_nets_mesh(sdf: &[f32], dims: [u32; 3]) -> Mesh {
+    let shape = RuntimeShape::<u32, 3>::new(dims);
+    assert_eq!(
+        sdf.len(),
+        shape.size() as usize,
+        "sdf length must equal dims product"
+    );
+    let mut buffer = SurfaceNetsBuffer::default();
+    surface_nets(
+        sdf,
+        &shape,
+        [0; 3],
+        [dims[0] - 1, dims[1] - 1, dims[2] - 1],
+        &mut buffer,
+    );
+    Mesh {
+        positions: buffer.positions,
+        normals: buffer.normals,
+        indices: buffer.indices,
+    }
+}
+
 /// Synthetic signed-distance fields meshed with the CPU floor — used to validate
 /// the extraction stage against known ground truth before real depth is fused.
 pub mod demo {
+    use super::surface_nets_mesh;
     use super::Mesh;
-    use fast_surface_nets::ndshape::{ConstShape, ConstShape3u32};
-    use fast_surface_nets::{surface_nets, SurfaceNetsBuffer};
+    use fast_surface_nets::ndshape::{RuntimeShape, Shape};
 
-    /// Grid resolution per axis (including the 1-voxel border surface-nets needs).
+    /// Grid resolution per axis for the demo sphere.
     pub const N: u32 = 64;
-    type GridShape = ConstShape3u32<64, 64, 64>;
 
     /// Mesh a sphere of `radius` (in normalized units, grid spans ~[-1, 1]).
     pub fn sphere_mesh(radius: f32) -> Mesh {
+        let dims = [N; 3];
+        let shape = RuntimeShape::<u32, 3>::new(dims);
         let half = (N as f32) / 2.0;
         let center = half - 0.5;
-        let sdf: Vec<f32> = (0..GridShape::SIZE)
+        let sdf: Vec<f32> = (0..shape.size())
             .map(|i| {
-                let [x, y, z] = GridShape::delinearize(i);
+                let [x, y, z] = shape.delinearize(i);
                 let px = (x as f32 - center) / half;
                 let py = (y as f32 - center) / half;
                 let pz = (z as f32 - center) / half;
                 (px * px + py * py + pz * pz).sqrt() - radius
             })
             .collect();
-
-        let mut buffer = SurfaceNetsBuffer::default();
-        surface_nets(&sdf, &GridShape {}, [0; 3], [N - 1; 3], &mut buffer);
-        Mesh {
-            positions: buffer.positions,
-            normals: buffer.normals,
-            indices: buffer.indices,
-        }
+        surface_nets_mesh(&sdf, dims)
     }
 }
 

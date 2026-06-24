@@ -788,6 +788,7 @@ name = "ge-viewer"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "bytemuck",
  "ge-backend-trait",
  "ge-mesh",
  "nokhwa",

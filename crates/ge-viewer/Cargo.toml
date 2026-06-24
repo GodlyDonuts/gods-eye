@@ -11,7 +11,7 @@ authors.workspace = true
 default = []
 # Opens an interactive GPU window (three-d, wgpu-backed). Off by default so the
 # core build and CI stay headless and dependency-light.
-window = ["dep:three-d"]
+window = ["dep:three-d", "dep:bytemuck"]
 # Webcam capture source (nokhwa). Off by default; pulls native camera bindings.
 camera = ["dep:nokhwa"]
 
@@ -21,6 +21,7 @@ ge-mesh.workspace = true
 anyhow.workspace = true
 three-d = { version = "0.19", optional = true }
 nokhwa = { version = "0.10", features = ["input-native"], optional = true }
+bytemuck = { version = "1", optional = true }
 
 [[example]]
 name = "view"

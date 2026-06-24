@@ -230,7 +230,7 @@ where
 {
     use three_d::{
         degrees, vec2, Camera, ClearState, ColorMaterial, CpuTexture, FrameOutput, Gm, Rectangle,
-        Srgba, Texture2DRef, TextureData, Window, WindowSettings,
+        Srgba, Texture2D, Texture2DRef, TextureData, Window, WindowSettings,
     };
 
     let window = Window::new(WindowSettings {
@@ -241,30 +241,42 @@ where
     .map_err(|e| anyhow::anyhow!("{e}"))?;
     let context = window.gl();
 
+    let mut tex: Option<Texture2DRef> = None;
+    let mut tex_dims = (0u32, 0u32);
     let mut quad: Option<Gm<Rectangle, ColorMaterial>> = None;
+    let mut quad_vp = (0u32, 0u32);
 
     window.render_loop(move |frame_input| {
+        let vp = frame_input.viewport;
+
         // Pull the latest frame; keep the previous one on transient errors.
         if let Ok(Some(frame)) = next_frame() {
             if frame.rgb.len() == frame.pixel_count() * 3 {
-                // three-d's 2D origin is bottom-left while camera rows are
-                // top-first, so flip vertically to keep the image upright.
-                let w = frame.width as usize;
-                let mut data: Vec<[u8; 3]> = Vec::with_capacity(frame.pixel_count());
-                for row in (0..frame.height as usize).rev() {
-                    let base = row * w * 3;
-                    for x in 0..w {
-                        let p = base + x * 3;
-                        data.push([frame.rgb[p], frame.rgb[p + 1], frame.rgb[p + 2]]);
-                    }
+                // RGB8 rows top-first (no flip — that matches the on-screen
+                // orientation). Reinterpret &[u8] as &[[u8; 3]] with no copy.
+                let data: &[[u8; 3]] = bytemuck::cast_slice(&frame.rgb);
+                if tex.is_none() || tex_dims != (frame.width, frame.height) {
+                    // First frame or resolution change: allocate the texture once.
+                    let cpu = CpuTexture {
+                        data: TextureData::RgbU8(data.to_vec()),
+                        width: frame.width,
+                        height: frame.height,
+                        ..Default::default()
+                    };
+                    tex = Some(Texture2DRef::from_texture(Texture2D::new(&context, &cpu)));
+                    tex_dims = (frame.width, frame.height);
+                    quad = None; // rebuild quad to point at the new texture
+                } else if let Some(t) = &tex {
+                    // Steady state: update the existing GPU texture in place
+                    // (no per-frame allocation — this is the hot path).
+                    t.texture.fill(data);
                 }
-                let cpu = CpuTexture {
-                    data: TextureData::RgbU8(data),
-                    width: frame.width,
-                    height: frame.height,
-                    ..Default::default()
-                };
-                let vp = frame_input.viewport;
+            }
+        }
+
+        // (Re)build the fullscreen quad only when the texture or window changed.
+        if let Some(t) = &tex {
+            if quad.is_none() || quad_vp != (vp.width, vp.height) {
                 let rect = Rectangle::new(
                     &context,
                     vec2(vp.width as f32 * 0.5, vp.height as f32 * 0.5),
@@ -275,15 +287,16 @@ where
                 quad = Some(Gm::new(
                     rect,
                     ColorMaterial {
-                        texture: Some(Texture2DRef::from_cpu_texture(&context, &cpu)),
+                        texture: Some(t.clone()),
                         color: Srgba::WHITE,
                         ..Default::default()
                     },
                 ));
+                quad_vp = (vp.width, vp.height);
             }
         }
 
-        let camera = Camera::new_2d(frame_input.viewport);
+        let camera = Camera::new_2d(vp);
         let screen = frame_input.screen();
         screen.clear(ClearState::color_and_depth(0.0, 0.0, 0.0, 1.0, 1.0));
         if let Some(q) = &quad {

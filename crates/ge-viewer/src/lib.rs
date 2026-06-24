@@ -390,6 +390,35 @@ impl WebcamSource {
         camera
             .open_stream()
             .map_err(|e| anyhow::anyhow!("open stream: {e}"))?;
+
+        // Diagnostics: what we actually negotiated, and every mode on offer.
+        let fmt = camera.camera_format();
+        eprintln!(
+            "[ge-viewer] streaming {}x{} @ {} fps ({:?}), aspect {:.3}",
+            fmt.width(),
+            fmt.height(),
+            fmt.frame_rate(),
+            fmt.format(),
+            fmt.width() as f32 / fmt.height().max(1) as f32
+        );
+        match camera.compatible_camera_formats() {
+            Ok(mut formats) => {
+                formats.sort_by_key(|f| (f.width() * f.height(), f.frame_rate()));
+                eprintln!("[ge-viewer] {} formats available:", formats.len());
+                for f in &formats {
+                    eprintln!(
+                        "    {:>5}x{:<5} @ {:>3} fps  ({:?})  aspect {:.3}",
+                        f.width(),
+                        f.height(),
+                        f.frame_rate(),
+                        f.format(),
+                        f.width() as f32 / f.height().max(1) as f32
+                    );
+                }
+            }
+            Err(e) => eprintln!("[ge-viewer] could not list formats: {e}"),
+        }
+
         Ok(Self { camera })
     }
 }

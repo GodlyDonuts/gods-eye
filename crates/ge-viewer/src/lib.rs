@@ -274,16 +274,20 @@ where
             }
         }
 
-        // (Re)build the fullscreen quad only when the texture or window changed.
+        // (Re)build the quad only when the texture or window changed. The quad
+        // is sized to the image's aspect ratio (letterboxed/pillarboxed within
+        // the window) so the feed is never stretched.
         if let Some(t) = &tex {
             if quad.is_none() || quad_vp != (vp.width, vp.height) {
-                let rect = Rectangle::new(
-                    &context,
-                    vec2(vp.width as f32 * 0.5, vp.height as f32 * 0.5),
-                    degrees(0.0),
-                    vp.width as f32,
-                    vp.height as f32,
-                );
+                let (vw, vh) = (vp.width.max(1) as f32, vp.height.max(1) as f32);
+                let (iw, ih) = (tex_dims.0.max(1) as f32, tex_dims.1.max(1) as f32);
+                let img_aspect = iw / ih;
+                let (qw, qh) = if img_aspect > vw / vh {
+                    (vw, vw / img_aspect) // fit width: letterbox top/bottom
+                } else {
+                    (vh * img_aspect, vh) // fit height: pillarbox left/right
+                };
+                let rect = Rectangle::new(&context, vec2(vw * 0.5, vh * 0.5), degrees(0.0), qw, qh);
                 quad = Some(Gm::new(
                     rect,
                     ColorMaterial {

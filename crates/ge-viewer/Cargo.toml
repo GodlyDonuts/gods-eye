@@ -1,6 +1,6 @@
 [package]
 name = "ge-viewer"
-description = "Live mesh viewer. Headless sinks always; a three-d window behind the `window` feature."
+description = "Live mesh + camera viewers. Headless sinks always; GPU windows behind features."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,12 +12,20 @@ default = []
 # Opens an interactive GPU window (three-d, wgpu-backed). Off by default so the
 # core build and CI stay headless and dependency-light.
 window = ["dep:three-d"]
+# Webcam capture source (nokhwa). Off by default; pulls native camera bindings.
+camera = ["dep:nokhwa"]
 
 [dependencies]
+ge-backend-trait.workspace = true
 ge-mesh.workspace = true
 anyhow.workspace = true
 three-d = { version = "0.19", optional = true }
+nokhwa = { version = "0.10", features = ["input-native"], optional = true }
 
 [[example]]
 name = "view"
 required-features = ["window"]
+
+[[example]]
+name = "camera"
+required-features = ["window", "camera"]

@@ -105,7 +105,7 @@ impl Tsdf {
                         continue;
                     }
                     let d = depth.depth_m[(v as usize) * depth.width as usize + (u as usize)];
-                    if !(d > 0.0) {
+                    if d <= 0.0 || d.is_nan() {
                         continue;
                     }
                     // Signed distance along the ray: + in front of the surface.

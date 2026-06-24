@@ -46,7 +46,10 @@ const DAV2_STD: [f32; 3] = [0.229, 0.224, 0.225];
 /// writes.
 pub fn preprocess_rgb_to_chw(frame: &Frame, size: u32) -> anyhow::Result<Vec<f32>> {
     anyhow::ensure!(size > 0, "input size must be non-zero");
-    anyhow::ensure!(size % 14 == 0, "input size must be divisible by 14");
+    anyhow::ensure!(
+        size.is_multiple_of(14),
+        "input size must be divisible by 14"
+    );
     anyhow::ensure!(
         frame.rgb.len() == frame.pixel_count() * 3,
         "frame RGB buffer has length {}, expected {}",

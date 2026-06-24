@@ -6,7 +6,9 @@
 //! and a synchronous single-thread runner used for smoke tests; the threaded
 //! frame-graph lands incrementally. See `docs/design/ARCHITECTURE.md`.
 
-use ge_backend_trait::{CaptureSource, DepthBackend, DepthMap, Frame, Intrinsics, Pose};
+use ge_backend_trait::{
+    CaptureSource, DepthBackend, DepthMap, Frame, Intrinsics, Pose, PoseEstimator,
+};
 use ge_mesh::Mesh;
 
 /// Pipeline configuration.
@@ -143,6 +145,28 @@ where
     D: DepthBackend,
     S: PipelineSink,
 {
+    let mut pose = IdentityPose;
+    run_fusion_with_pose_sync(source, depth, &mut pose, config, sink)
+}
+
+/// Run capture -> depth -> pose estimation -> TSDF fusion -> mesh extraction.
+///
+/// This is the viewer-facing producer path. M0 callers can pass
+/// [`IdentityPose`]; M1 can replace it with direct visual odometry without
+/// changing the packet contract consumed by viewers.
+pub fn run_fusion_with_pose_sync<C, D, P, S>(
+    source: &mut C,
+    depth: &mut D,
+    pose: &mut P,
+    config: FusionConfig,
+    sink: &mut S,
+) -> anyhow::Result<usize>
+where
+    C: CaptureSource,
+    D: DepthBackend,
+    P: PoseEstimator,
+    S: PipelineSink,
+{
     anyhow::ensure!(config.voxel_size_m > 0.0, "voxel size must be positive");
     anyhow::ensure!(config.truncation_m > 0.0, "truncation must be positive");
     anyhow::ensure!(
@@ -176,10 +200,11 @@ where
         };
         sink.on_depth(&frame_packet, &depth_packet)?;
 
+        let cam_to_world = pose.track(&frame_packet.frame, &depth_packet.depth)?;
         let pose_packet = PosePacket {
             frame_index: frame_packet.frame_index,
             timestamp_ns: frame_packet.timestamp_ns,
-            cam_to_world: Pose::IDENTITY,
+            cam_to_world,
         };
         sink.on_pose(&frame_packet, &pose_packet)?;
 
@@ -191,7 +216,7 @@ where
         );
 
         n += 1;
-        if n % config.mesh_every_n == 0 {
+        if n.is_multiple_of(config.mesh_every_n) {
             let mesh_packet = MeshPacket {
                 frame_index: frame_packet.frame_index,
                 timestamp_ns: frame_packet.timestamp_ns,
@@ -202,6 +227,15 @@ where
     }
 
     Ok(n)
+}
+
+/// A trivial pose estimator that always reports the camera at the world origin.
+pub struct IdentityPose;
+
+impl PoseEstimator for IdentityPose {
+    fn track(&mut self, _frame: &Frame, _depth: &DepthMap) -> anyhow::Result<Pose> {
+        Ok(Pose::IDENTITY)
+    }
 }
 
 /// A conservative 60-degree pinhole fallback for sources without calibration.

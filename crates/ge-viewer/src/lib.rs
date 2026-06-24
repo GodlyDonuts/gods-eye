@@ -2,8 +2,13 @@
 //!
 //! Two implementations are planned behind the [`Viewer`] trait: `rerun`
 //! out-of-process for development (rich, but needs a 16 GB dev box), and
-//! `three-d` + `egui` in-process for the shipped experience (fits 8 GB). M0
-//! ships [`NullViewer`] plus a counting viewer for headless CI.
+//! `three-d` + `egui` in-process for the shipped experience (fits 8 GB).
+//!
+//! Today this crate ships the headless [`Viewer`] sinks (always available), a
+//! PLY loader, and [`view_mesh`] — an interactive `three-d` window behind the
+//! `window` feature.
+
+use std::path::Path;
 
 use ge_mesh::Mesh;
 
@@ -35,5 +40,202 @@ impl Viewer for CountingViewer {
         self.updates += 1;
         self.last_triangles = mesh.triangle_count();
         Ok(())
+    }
+}
+
+/// Load a mesh from an ASCII PLY file produced by [`Mesh::write_ply`].
+///
+/// Supports `float x/y/z` (+ optional `nx/ny/nz`) vertices and triangle faces.
+pub fn load_ply(path: &Path) -> anyhow::Result<Mesh> {
+    use std::io::{BufRead, BufReader};
+
+    let mut reader = BufReader::new(std::fs::File::open(path)?);
+    let mut line = String::new();
+    let (mut n_verts, mut n_faces, mut has_normals) = (0usize, 0usize, false);
+
+    loop {
+        line.clear();
+        anyhow::ensure!(
+            reader.read_line(&mut line)? > 0,
+            "unexpected EOF in PLY header"
+        );
+        let l = line.trim();
+        if let Some(rest) = l.strip_prefix("element vertex ") {
+            n_verts = rest.trim().parse()?;
+        } else if let Some(rest) = l.strip_prefix("element face ") {
+            n_faces = rest.trim().parse()?;
+        } else if l == "property float nx" {
+            has_normals = true;
+        } else if l == "end_header" {
+            break;
+        }
+    }
+
+    let mut positions = Vec::with_capacity(n_verts);
+    let mut normals = Vec::with_capacity(if has_normals { n_verts } else { 0 });
+    for _ in 0..n_verts {
+        line.clear();
+        anyhow::ensure!(
+            reader.read_line(&mut line)? > 0,
+            "unexpected EOF in PLY vertices"
+        );
+        let v: Vec<f32> = line
+            .split_whitespace()
+            .map(|s| s.parse::<f32>())
+            .collect::<Result<_, _>>()?;
+        anyhow::ensure!(v.len() >= 3, "vertex line has fewer than 3 floats");
+        positions.push([v[0], v[1], v[2]]);
+        if has_normals {
+            anyhow::ensure!(v.len() >= 6, "expected normals but vertex line is short");
+            normals.push([v[3], v[4], v[5]]);
+        }
+    }
+
+    let mut indices = Vec::with_capacity(n_faces * 3);
+    for _ in 0..n_faces {
+        line.clear();
+        anyhow::ensure!(
+            reader.read_line(&mut line)? > 0,
+            "unexpected EOF in PLY faces"
+        );
+        let f: Vec<u32> = line
+            .split_whitespace()
+            .map(|s| s.parse::<u32>())
+            .collect::<Result<_, _>>()?;
+        anyhow::ensure!(
+            f.len() >= 4 && f[0] == 3,
+            "only triangle faces are supported"
+        );
+        indices.extend_from_slice(&f[1..4]);
+    }
+
+    Ok(Mesh {
+        positions,
+        normals,
+        indices,
+    })
+}
+
+/// Open an interactive window showing `mesh`, with orbit/zoom controls.
+///
+/// Blocks until the window is closed. Requires the `window` feature.
+#[cfg(feature = "window")]
+pub fn view_mesh(mesh: &Mesh, title: &str) -> anyhow::Result<()> {
+    use three_d::{
+        degrees, vec3, AmbientLight, Camera, ClearState, CpuMaterial, CpuMesh, DirectionalLight,
+        FrameOutput, Gm, Indices, Light, OrbitControl, PhysicalMaterial, Positions, Srgba, Vec3,
+        Window, WindowSettings,
+    };
+
+    anyhow::ensure!(!mesh.positions.is_empty(), "mesh has no vertices");
+
+    let window = Window::new(WindowSettings {
+        title: title.to_string(),
+        max_size: Some((1280, 720)),
+        ..Default::default()
+    })
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let context = window.gl();
+
+    // Axis-aligned bounds for framing the camera.
+    let mut mn = [f32::MAX; 3];
+    let mut mx = [f32::MIN; 3];
+    for p in &mesh.positions {
+        for i in 0..3 {
+            mn[i] = mn[i].min(p[i]);
+            mx[i] = mx[i].max(p[i]);
+        }
+    }
+    let center = vec3(
+        (mn[0] + mx[0]) * 0.5,
+        (mn[1] + mx[1]) * 0.5,
+        (mn[2] + mx[2]) * 0.5,
+    );
+    let dx = mx[0] - mn[0];
+    let dy = mx[1] - mn[1];
+    let dz = mx[2] - mn[2];
+    let extent = (dx * dx + dy * dy + dz * dz).sqrt().max(1e-3);
+
+    let positions: Vec<Vec3> = mesh
+        .positions
+        .iter()
+        .map(|p| vec3(p[0], p[1], p[2]))
+        .collect();
+    let mut cpu_mesh = CpuMesh {
+        positions: Positions::F32(positions),
+        indices: Indices::U32(mesh.indices.clone()),
+        ..Default::default()
+    };
+    if mesh.normals.len() == mesh.positions.len() {
+        cpu_mesh.normals = Some(
+            mesh.normals
+                .iter()
+                .map(|n| vec3(n[0], n[1], n[2]))
+                .collect(),
+        );
+    } else {
+        cpu_mesh.compute_normals();
+    }
+
+    let model = Gm::new(
+        three_d::Mesh::new(&context, &cpu_mesh),
+        PhysicalMaterial::new_opaque(
+            &context,
+            &CpuMaterial {
+                albedo: Srgba::new(180, 185, 195, 255),
+                roughness: 0.7,
+                metallic: 0.1,
+                ..Default::default()
+            },
+        ),
+    );
+
+    let mut camera = Camera::new_perspective(
+        window.viewport(),
+        center + vec3(extent * 0.6, -extent * 0.6, -extent * 1.4),
+        center,
+        vec3(0.0, -1.0, 0.0),
+        degrees(45.0),
+        extent * 0.01,
+        extent * 10.0,
+    );
+    let mut control = OrbitControl::new(center, extent * 0.1, extent * 5.0);
+    let light = DirectionalLight::new(&context, 2.0, Srgba::WHITE, vec3(-0.5, -1.0, -0.7));
+    let ambient = AmbientLight::new(&context, 0.4, Srgba::WHITE);
+
+    window.render_loop(move |mut frame_input| {
+        camera.set_viewport(frame_input.viewport);
+        control.handle_events(&mut camera, &mut frame_input.events);
+        frame_input
+            .screen()
+            .clear(ClearState::color_and_depth(0.08, 0.09, 0.11, 1.0, 1.0))
+            .render(
+                &camera,
+                &model,
+                &[&light as &dyn Light, &ambient as &dyn Light],
+            );
+        FrameOutput::default()
+    });
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ply_round_trips_through_loader() {
+        let mut m = Mesh::quad([[0.0; 3], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]]);
+        m.normals = vec![[0.0, 0.0, 1.0]; 4];
+        let path = std::env::temp_dir().join(format!("ge-viewer-ply-{}.ply", std::process::id()));
+        m.write_ply(&path).unwrap();
+
+        let loaded = load_ply(&path).unwrap();
+        assert_eq!(loaded.vertex_count(), 4);
+        assert_eq!(loaded.triangle_count(), 2);
+        assert_eq!(loaded.normals.len(), 4);
+        assert_eq!(loaded.positions[1], [1.0, 0.0, 0.0]);
+        let _ = std::fs::remove_file(path);
     }
 }

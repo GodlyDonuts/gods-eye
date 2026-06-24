@@ -1,12 +1,23 @@
 [package]
 name = "ge-viewer"
-description = "Live mesh viewer trait. NullViewer now; rerun (dev) + three-d/egui (shipped) later."
+description = "Live mesh viewer. Headless sinks always; a three-d window behind the `window` feature."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+# Opens an interactive GPU window (three-d, wgpu-backed). Off by default so the
+# core build and CI stay headless and dependency-light.
+window = ["dep:three-d"]
+
 [dependencies]
 ge-mesh.workspace = true
 anyhow.workspace = true
+three-d = { version = "0.19", optional = true }
+
+[[example]]
+name = "view"
+required-features = ["window"]

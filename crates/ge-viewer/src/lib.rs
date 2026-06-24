@@ -314,8 +314,60 @@ pub struct WebcamSource {
     camera: nokhwa::Camera,
 }
 
+/// An available camera device.
+#[cfg(feature = "camera")]
+#[derive(Clone, Debug)]
+pub struct CameraDevice {
+    pub index: u32,
+    pub name: String,
+    pub description: String,
+}
+
+/// Enumerate the cameras the OS exposes (FaceTime, Continuity Camera, etc.).
+///
+/// On macOS an iPhone/iPad connected via Continuity Camera appears here as its
+/// own device — pick it by name with [`WebcamSource::open_named`].
+#[cfg(feature = "camera")]
+pub fn list_cameras() -> anyhow::Result<Vec<CameraDevice>> {
+    use nokhwa::utils::{ApiBackend, CameraIndex};
+
+    let infos =
+        nokhwa::query(ApiBackend::Auto).map_err(|e| anyhow::anyhow!("query cameras: {e}"))?;
+    let mut devices = Vec::new();
+    for info in infos {
+        // Only numerically-indexed devices can be opened by index here.
+        if let CameraIndex::Index(idx) = info.index() {
+            devices.push(CameraDevice {
+                index: *idx,
+                name: info.human_name(),
+                description: info.description().to_string(),
+            });
+        }
+    }
+    Ok(devices)
+}
+
 #[cfg(feature = "camera")]
 impl WebcamSource {
+    /// Open the first camera whose name contains `needle` (case-insensitive),
+    /// e.g. `"iPhone"` or `"FaceTime"`.
+    pub fn open_named(needle: &str) -> anyhow::Result<Self> {
+        let devices = list_cameras()?;
+        let lc = needle.to_lowercase();
+        let device = devices
+            .iter()
+            .find(|d| d.name.to_lowercase().contains(&lc))
+            .ok_or_else(|| {
+                let avail = devices
+                    .iter()
+                    .map(|d| format!("[{}] {}", d.index, d.name))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                anyhow::anyhow!("no camera matching {needle:?}; available: {avail}")
+            })?;
+        Self::open(device.index)
+    }
+
     /// Open the camera at `index` (0 = default) and start streaming.
     ///
     /// On macOS this triggers a camera-permission prompt; the process must be

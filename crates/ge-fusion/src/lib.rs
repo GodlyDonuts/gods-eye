@@ -250,6 +250,82 @@ pub mod gpu {
             })
         }
 
+        /// Allocate a dense TSDF volume whose TSDF and weight buffers stay
+        /// resident on the GPU across integration calls.
+        pub fn create_volume(
+            &self,
+            dims: [u32; 3],
+            voxel_size: f32,
+            origin: [f32; 3],
+            trunc: f32,
+        ) -> WgpuTsdfVolume {
+            let cpu = Tsdf::new(dims, voxel_size, origin, trunc);
+            WgpuTsdfVolume {
+                dims,
+                voxel_size,
+                origin: cpu.origin.to_array(),
+                trunc,
+                voxel_count: cpu.voxel_count(),
+                tsdf_buffer: self.storage_buffer("resident tsdf", cpu.tsdf_values()),
+                weight_buffer: self.storage_buffer("resident weight", cpu.weights()),
+            }
+        }
+
+        /// Integrate one depth frame into a resident GPU volume.
+        ///
+        /// Depth/confidence and params are uploaded per call, but the large
+        /// TSDF/weight buffers remain on the GPU. This removes the most obvious
+        /// per-frame transfer cost from the initial parity wrapper.
+        pub fn integrate_volume(
+            &self,
+            volume: &WgpuTsdfVolume,
+            depth: &DepthMap,
+            intr: &Intrinsics,
+            cam_to_world: &Pose,
+        ) -> anyhow::Result<()> {
+            self.validate_depth(depth)?;
+
+            let depth_buffer = self.storage_buffer("depth", &depth.depth_m);
+            let confidence_storage;
+            let confidence_slice: &[f32] = if let Some(confidence) = &depth.confidence {
+                confidence
+            } else {
+                confidence_storage = vec![1.0f32];
+                &confidence_storage
+            };
+            let confidence_buffer = self.storage_buffer("confidence", confidence_slice);
+            let params = GpuParams::new_volume(volume, depth, intr, cam_to_world);
+            let params_buffer = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("tsdf params"),
+                    contents: bytemuck::bytes_of(&params),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("resident tsdf integrate bind group"),
+                layout: &self.layout,
+                entries: &[
+                    bind_entry(0, &volume.tsdf_buffer),
+                    bind_entry(1, &volume.weight_buffer),
+                    bind_entry(2, &depth_buffer),
+                    bind_entry(3, &confidence_buffer),
+                    bind_entry(4, &params_buffer),
+                ],
+            });
+
+            self.dispatch(volume.voxel_count as u32, &bind_group);
+            Ok(())
+        }
+
+        /// Download a resident GPU volume into the CPU reference representation.
+        pub fn download_volume(&self, volume: &WgpuTsdfVolume) -> anyhow::Result<Tsdf> {
+            let mut tsdf = Tsdf::new(volume.dims, volume.voxel_size, volume.origin, volume.trunc);
+            tsdf.tsdf = self.read_f32_buffer(&volume.tsdf_buffer, volume.voxel_count)?;
+            tsdf.weight = self.read_f32_buffer(&volume.weight_buffer, volume.voxel_count)?;
+            Ok(tsdf)
+        }
+
         pub fn integrate(
             &self,
             tsdf: &mut Tsdf,
@@ -257,16 +333,7 @@ pub mod gpu {
             intr: &Intrinsics,
             cam_to_world: &Pose,
         ) -> anyhow::Result<()> {
-            anyhow::ensure!(
-                depth.depth_m.len() == depth.width as usize * depth.height as usize,
-                "depth buffer length does not match dimensions"
-            );
-            if let Some(confidence) = &depth.confidence {
-                anyhow::ensure!(
-                    confidence.len() == depth.depth_m.len(),
-                    "confidence buffer length does not match depth"
-                );
-            }
+            self.validate_depth(depth)?;
 
             let total = tsdf.voxel_count() as u32;
             let tsdf_buffer = self.storage_buffer("tsdf", &tsdf.tsdf);
@@ -300,6 +367,28 @@ pub mod gpu {
                 ],
             });
 
+            self.dispatch(total, &bind_group);
+
+            tsdf.tsdf = self.read_f32_buffer(&tsdf_buffer, tsdf.tsdf.len())?;
+            tsdf.weight = self.read_f32_buffer(&weight_buffer, tsdf.weight.len())?;
+            Ok(())
+        }
+
+        fn validate_depth(&self, depth: &DepthMap) -> anyhow::Result<()> {
+            anyhow::ensure!(
+                depth.depth_m.len() == depth.width as usize * depth.height as usize,
+                "depth buffer length does not match dimensions"
+            );
+            if let Some(confidence) = &depth.confidence {
+                anyhow::ensure!(
+                    confidence.len() == depth.depth_m.len(),
+                    "confidence buffer length does not match depth"
+                );
+            }
+            Ok(())
+        }
+
+        fn dispatch(&self, total: u32, bind_group: &wgpu::BindGroup) {
             let mut encoder = self
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -311,14 +400,10 @@ pub mod gpu {
                     timestamp_writes: None,
                 });
                 pass.set_pipeline(&self.pipeline);
-                pass.set_bind_group(0, &bind_group, &[]);
+                pass.set_bind_group(0, bind_group, &[]);
                 pass.dispatch_workgroups(total.div_ceil(WORKGROUP_SIZE), 1, 1);
             }
             self.queue.submit(Some(encoder.finish()));
-
-            tsdf.tsdf = self.read_f32_buffer(&tsdf_buffer, tsdf.tsdf.len())?;
-            tsdf.weight = self.read_f32_buffer(&weight_buffer, tsdf.weight.len())?;
-            Ok(())
         }
 
         fn storage_buffer(&self, label: &str, data: &[f32]) -> wgpu::Buffer {
@@ -343,6 +428,17 @@ pub mod gpu {
             anyhow::ensure!(out.len() == len, "downloaded buffer length mismatch");
             Ok(out)
         }
+    }
+
+    /// Dense GPU-resident TSDF volume.
+    pub struct WgpuTsdfVolume {
+        pub dims: [u32; 3],
+        pub voxel_size: f32,
+        pub origin: [f32; 3],
+        pub trunc: f32,
+        voxel_count: usize,
+        tsdf_buffer: wgpu::Buffer,
+        weight_buffer: wgpu::Buffer,
     }
 
     #[repr(C)]
@@ -375,6 +471,33 @@ pub mod gpu {
                 origin: [tsdf.origin.x, tsdf.origin.y, tsdf.origin.z, 0.0],
                 intrinsics: [intr.fx, intr.fy, intr.cx, intr.cy],
                 scalars: [tsdf.voxel_size, tsdf.trunc, 0.0, 0.0],
+                world_to_cam: glam::Mat4::from(world_to_cam).to_cols_array(),
+            }
+        }
+
+        fn new_volume(
+            volume: &WgpuTsdfVolume,
+            depth: &DepthMap,
+            intr: &Intrinsics,
+            cam_to_world: &Pose,
+        ) -> Self {
+            let world_to_cam = cam_to_world.inverse();
+            Self {
+                dims: [
+                    volume.dims[0],
+                    volume.dims[1],
+                    volume.dims[2],
+                    volume.voxel_count as u32,
+                ],
+                depth_size: [
+                    depth.width,
+                    depth.height,
+                    u32::from(depth.confidence.is_some()),
+                    0,
+                ],
+                origin: [volume.origin[0], volume.origin[1], volume.origin[2], 0.0],
+                intrinsics: [intr.fx, intr.fy, intr.cx, intr.cy],
+                scalars: [volume.voxel_size, volume.trunc, 0.0, 0.0],
                 world_to_cam: glam::Mat4::from(world_to_cam).to_cols_array(),
             }
         }
@@ -425,6 +548,43 @@ pub mod gpu {
             integrator
                 .integrate(&mut gpu, &depth, &intr, &Pose::IDENTITY)
                 .unwrap();
+
+            assert_eq!(cpu.voxel_count(), gpu.voxel_count());
+            for (a, b) in cpu.tsdf_values().iter().zip(gpu.tsdf_values()) {
+                assert!((a - b).abs() < 1e-4, "tsdf mismatch: cpu={a} gpu={b}");
+            }
+            for (a, b) in cpu.weights().iter().zip(gpu.weights()) {
+                assert!((a - b).abs() < 1e-4, "weight mismatch: cpu={a} gpu={b}");
+            }
+        }
+
+        #[test]
+        fn resident_gpu_volume_matches_cpu_after_two_integrations() {
+            let integrator = match WgpuTsdfIntegrator::new() {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("skipping GPU resident parity test: {e}");
+                    return;
+                }
+            };
+            let (depth, intr) = scenes::wall_with_panel(32);
+            let dims = [32, 32, 24];
+            let voxel = 0.08;
+            let origin = [-1.3, -1.3, 1.2];
+            let trunc = 4.0 * voxel;
+
+            let mut cpu = Tsdf::new(dims, voxel, origin, trunc);
+            cpu.integrate(&depth, &intr, &Pose::IDENTITY);
+            cpu.integrate(&depth, &intr, &Pose::IDENTITY);
+
+            let gpu_volume = integrator.create_volume(dims, voxel, origin, trunc);
+            integrator
+                .integrate_volume(&gpu_volume, &depth, &intr, &Pose::IDENTITY)
+                .unwrap();
+            integrator
+                .integrate_volume(&gpu_volume, &depth, &intr, &Pose::IDENTITY)
+                .unwrap();
+            let gpu = integrator.download_volume(&gpu_volume).unwrap();
 
             assert_eq!(cpu.voxel_count(), gpu.voxel_count());
             for (a, b) in cpu.tsdf_values().iter().zip(gpu.tsdf_values()) {

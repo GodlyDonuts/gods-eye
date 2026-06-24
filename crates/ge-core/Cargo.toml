@@ -9,5 +9,7 @@ authors.workspace = true
 
 [dependencies]
 ge-backend-trait.workspace = true
+ge-fusion.workspace = true
+ge-mesh.workspace = true
 crossbeam-channel.workspace = true
 anyhow.workspace = true

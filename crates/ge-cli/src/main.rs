@@ -7,7 +7,7 @@
 //! budget.
 
 use clap::{Parser, Subcommand};
-use ge_core::run_sync;
+use ge_core::{run_fusion_sync, run_sync, FusionConfig, MeshPacket, PipelineSink};
 
 #[derive(Parser, Debug)]
 #[command(name = "gods-eye", version, about)]
@@ -36,6 +36,15 @@ struct RunArgs {
     /// Optional PNG/JPEG image to replay as the capture source.
     #[arg(long)]
     image: Option<String>,
+    /// Optional PLY path for the last mesh emitted by the headless fusion path.
+    #[arg(long)]
+    emit_mesh: Option<String>,
+    /// Voxel edge length in metres for `--emit-mesh`.
+    #[arg(long, default_value_t = 0.05)]
+    voxel: f32,
+    /// Emit a mesh every N integrated frames for `--emit-mesh`.
+    #[arg(long, default_value_t = 1)]
+    mesh_every: usize,
     /// Synthetic frame width.
     #[arg(long, default_value_t = 640)]
     width: u32,
@@ -154,6 +163,43 @@ fn cmd_demo_mesh(args: DemoMeshArgs) -> anyhow::Result<()> {
 
 fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     let mut depth = ge_depth::ConstantDepth::new(2.5);
+    if let Some(out) = args.emit_mesh.as_deref() {
+        let config = FusionConfig {
+            voxel_size_m: args.voxel,
+            truncation_m: 4.0 * args.voxel,
+            mesh_every_n: args.mesh_every,
+            ..FusionConfig::default()
+        };
+        let mut sink = LastMeshSink::default();
+        let processed = if let Some(path) = args.image.as_deref() {
+            let mut source = ge_camera::ImageFileSource::open(path, args.frames)?;
+            run_fusion_sync(&mut source, &mut depth, config, &mut sink)?
+        } else {
+            let mut source = ge_camera::SolidColorSource::new(
+                args.width,
+                args.height,
+                args.frames,
+                [60, 120, 200],
+            );
+            run_fusion_sync(&mut source, &mut depth, config, &mut sink)?
+        };
+        let mesh = sink
+            .last_mesh
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no mesh was emitted"))?;
+        let path = std::path::Path::new(out);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        mesh.mesh.write_ply(path)?;
+        println!(
+            "gods-eye M0 producer: processed {processed} frame(s), wrote {} — {} vertices, {} triangles",
+            out,
+            mesh.mesh.vertex_count(),
+            mesh.mesh.triangle_count()
+        );
+        return Ok(());
+    }
 
     let mut depth_acc = 0.0f64;
     let processed = if let Some(path) = args.image.as_deref() {
@@ -172,6 +218,18 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     println!("gods-eye M0 spine: processed {processed} frame(s) (depth backend: constant)");
     let _ = depth_acc;
     Ok(())
+}
+
+#[derive(Default)]
+struct LastMeshSink {
+    last_mesh: Option<MeshPacket>,
+}
+
+impl PipelineSink for LastMeshSink {
+    fn on_mesh(&mut self, mesh: &MeshPacket) -> anyhow::Result<()> {
+        self.last_mesh = Some(mesh.clone());
+        Ok(())
+    }
 }
 
 #[cfg(feature = "onnx")]

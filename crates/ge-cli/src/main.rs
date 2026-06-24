@@ -22,6 +22,8 @@ enum Command {
     Run(RunArgs),
     /// Benchmark monocular depth inference latency (M0 spike).
     BenchDepth(BenchArgs),
+    /// Extract a triangle mesh from a synthetic SDF and write it to PLY.
+    DemoMesh(DemoMeshArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -56,12 +58,40 @@ struct BenchArgs {
     warmup: usize,
 }
 
+#[derive(clap::Args, Debug)]
+struct DemoMeshArgs {
+    /// Output PLY path.
+    #[arg(long, default_value = "out/sphere.ply")]
+    out: String,
+    /// Sphere radius in normalized grid units (~[0, 1]).
+    #[arg(long, default_value_t = 0.7)]
+    radius: f32,
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Run(args) => cmd_run(args),
         Command::BenchDepth(args) => cmd_bench_depth(args),
+        Command::DemoMesh(args) => cmd_demo_mesh(args),
     }
+}
+
+fn cmd_demo_mesh(args: DemoMeshArgs) -> anyhow::Result<()> {
+    let mesh = ge_mesh::demo::sphere_mesh(args.radius);
+    let path = std::path::Path::new(&args.out);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    mesh.write_ply(path)?;
+    println!(
+        "wrote {} — {} vertices, {} triangles (CPU surface-nets, sphere r={})",
+        args.out,
+        mesh.vertex_count(),
+        mesh.triangle_count(),
+        args.radius
+    );
+    Ok(())
 }
 
 fn cmd_run(args: RunArgs) -> anyhow::Result<()> {

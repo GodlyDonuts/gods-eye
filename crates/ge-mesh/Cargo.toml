@@ -9,3 +9,5 @@ authors.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+# Portable CPU isosurface mesher — the guaranteed floor below the GPU path.
+fast-surface-nets = "0.2"

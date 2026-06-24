@@ -267,6 +267,14 @@ fn validate_depth_shape(frame: &Frame, depth: &DepthMap) -> anyhow::Result<()> {
         depth.depth_m.len(),
         frame.pixel_count()
     );
+    if let Some(confidence) = &depth.confidence {
+        anyhow::ensure!(
+            confidence.len() == frame.pixel_count(),
+            "confidence buffer has length {}, expected {}",
+            confidence.len(),
+            frame.pixel_count()
+        );
+    }
     Ok(())
 }
 
@@ -334,6 +342,7 @@ mod tests {
                 width: 1,
                 height: 1,
                 depth_m: vec![1.0],
+                confidence: None,
             })
         }
     }
@@ -419,6 +428,7 @@ mod tests {
                 width: frame.width,
                 height: frame.height,
                 depth_m: vec![self.0; frame.pixel_count()],
+                confidence: None,
             })
         }
     }

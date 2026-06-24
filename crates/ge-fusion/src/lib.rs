@@ -108,6 +108,15 @@ impl Tsdf {
                     if d <= 0.0 || d.is_nan() {
                         continue;
                     }
+                    let depth_i = (v as usize) * depth.width as usize + (u as usize);
+                    let obs_weight = depth
+                        .confidence
+                        .as_ref()
+                        .map(|c| c[depth_i].clamp(0.0, 1.0))
+                        .unwrap_or(1.0);
+                    if obs_weight <= 0.0 {
+                        continue;
+                    }
                     // Signed distance along the ray: + in front of the surface.
                     let sdf = d - c.z;
                     if sdf < -self.trunc {
@@ -116,8 +125,8 @@ impl Tsdf {
                     let val = (sdf / self.trunc).clamp(-1.0, 1.0);
                     let i = self.linear(x, y, z);
                     let w = self.weight[i];
-                    self.tsdf[i] = (self.tsdf[i] * w + val) / (w + 1.0);
-                    self.weight[i] = w + 1.0;
+                    self.tsdf[i] = (self.tsdf[i] * w + val * obs_weight) / (w + obs_weight);
+                    self.weight[i] = w + obs_weight;
                 }
             }
         }
@@ -167,6 +176,7 @@ pub mod scenes {
                 width: size,
                 height: size,
                 depth_m,
+                confidence: None,
             },
             intr,
         )
@@ -202,6 +212,59 @@ mod tests {
         assert!(
             (1.6..2.7).contains(&mean_z),
             "surface depth {mean_z} should be near the wall/panel"
+        );
+    }
+
+    #[test]
+    fn low_confidence_conflicting_depth_moves_tsdf_less() {
+        let intr = Intrinsics {
+            fx: 1.0,
+            fy: 1.0,
+            cx: 0.5,
+            cy: 0.5,
+            width: 1,
+            height: 1,
+        };
+        let dims = [1, 1, 1];
+        let voxel = 1.0;
+        let origin = [-0.5, -0.5, 1.0];
+        let trunc = 1.0;
+
+        let initial = DepthMap {
+            width: 1,
+            height: 1,
+            depth_m: vec![1.25],
+            confidence: Some(vec![1.0]),
+        };
+        let high_conflict = DepthMap {
+            width: 1,
+            height: 1,
+            depth_m: vec![1.75],
+            confidence: Some(vec![1.0]),
+        };
+        let low_conflict = DepthMap {
+            width: 1,
+            height: 1,
+            depth_m: vec![1.75],
+            confidence: Some(vec![0.25]),
+        };
+
+        let mut high_tsdf = Tsdf::new(dims, voxel, origin, trunc);
+        high_tsdf.integrate(&initial, &intr, &Pose::IDENTITY);
+        high_tsdf.integrate(&high_conflict, &intr, &Pose::IDENTITY);
+        let mut low_tsdf = Tsdf::new(dims, voxel, origin, trunc);
+        low_tsdf.integrate(&initial, &intr, &Pose::IDENTITY);
+        low_tsdf.integrate(&low_conflict, &intr, &Pose::IDENTITY);
+
+        assert_eq!(high_tsdf.observed_voxels(), 1);
+        assert_eq!(low_tsdf.observed_voxels(), 1);
+        assert!(
+            high_tsdf.weight[0] > low_tsdf.weight[0],
+            "high-confidence observation should accumulate more weight"
+        );
+        assert!(
+            high_tsdf.tsdf[0] > low_tsdf.tsdf[0],
+            "high-confidence conflicting depth should move the TSDF farther"
         );
     }
 }

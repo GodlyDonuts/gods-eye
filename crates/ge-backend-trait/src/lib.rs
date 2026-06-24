@@ -55,6 +55,9 @@ pub struct DepthMap {
     pub height: u32,
     /// Row-major depth in meters, `len == width * height`.
     pub depth_m: Vec<f32>,
+    /// Optional row-major confidence weights in `[0, 1]`, same length as
+    /// `depth_m`. Missing confidence means every valid depth has weight 1.
+    pub confidence: Option<Vec<f32>>,
 }
 
 /// A 6-DoF camera pose expressed as a camera-to-world transform.

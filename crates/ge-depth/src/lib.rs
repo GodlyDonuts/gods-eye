@@ -31,6 +31,7 @@ impl DepthBackend for ConstantDepth {
             width: frame.width,
             height: frame.height,
             depth_m: vec![self.depth_m; frame.pixel_count()],
+            confidence: None,
         })
     }
 }
@@ -156,6 +157,63 @@ fn resize_depth_bilinear(
     }
 
     Ok(out)
+}
+
+/// Estimate per-pixel depth confidence from validity, distance, and local
+/// depth discontinuities.
+///
+/// This is intentionally model-agnostic: invalid values get zero weight, far
+/// values are down-weighted, and sharp local depth jumps are treated as likely
+/// object boundaries where monocular depth is least stable.
+pub fn estimate_confidence(depth: &DepthMap, far_m: f32) -> anyhow::Result<Vec<f32>> {
+    anyhow::ensure!(far_m > 0.0, "far_m must be positive");
+    anyhow::ensure!(
+        depth.depth_m.len() == (depth.width as usize) * (depth.height as usize),
+        "depth buffer has length {}, expected {}",
+        depth.depth_m.len(),
+        (depth.width as usize) * (depth.height as usize)
+    );
+
+    let w = depth.width as usize;
+    let h = depth.height as usize;
+    let mut confidence = vec![0.0f32; depth.depth_m.len()];
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            let d = depth.depth_m[i];
+            if d <= 0.0 || !d.is_finite() {
+                continue;
+            }
+
+            let mut max_jump = 0.0f32;
+            if x > 0 {
+                max_jump = max_jump.max(neighbor_jump(d, depth.depth_m[i - 1]));
+            }
+            if x + 1 < w {
+                max_jump = max_jump.max(neighbor_jump(d, depth.depth_m[i + 1]));
+            }
+            if y > 0 {
+                max_jump = max_jump.max(neighbor_jump(d, depth.depth_m[i - w]));
+            }
+            if y + 1 < h {
+                max_jump = max_jump.max(neighbor_jump(d, depth.depth_m[i + w]));
+            }
+
+            let range_w = (1.0 - (d / far_m).powi(2)).clamp(0.0, 1.0);
+            let edge_scale = 0.04 * d + 0.02;
+            let edge_w = (1.0 - max_jump / edge_scale).clamp(0.0, 1.0);
+            confidence[i] = range_w * edge_w;
+        }
+    }
+    Ok(confidence)
+}
+
+fn neighbor_jump(center: f32, neighbor: f32) -> f32 {
+    if neighbor <= 0.0 || !neighbor.is_finite() {
+        f32::INFINITY
+    } else {
+        (center - neighbor).abs()
+    }
 }
 
 #[cfg(feature = "onnx")]
@@ -288,6 +346,15 @@ mod onnx_backend {
             Ok(ge_backend_trait::DepthMap {
                 width: frame.width,
                 height: frame.height,
+                confidence: Some(crate::estimate_confidence(
+                    &ge_backend_trait::DepthMap {
+                        width: frame.width,
+                        height: frame.height,
+                        depth_m: depth_m.clone(),
+                        confidence: None,
+                    },
+                    20.0,
+                )?),
                 depth_m,
             })
         }
@@ -413,5 +480,27 @@ mod tests {
         assert_eq!(resized.len(), 12);
         assert_eq!(resized[0], 1.0);
         assert_eq!(resized[11], 4.0);
+    }
+
+    #[test]
+    fn confidence_rejects_invalid_and_downweights_edges() {
+        let depth = DepthMap {
+            width: 3,
+            height: 1,
+            depth_m: vec![2.0, 2.0, 4.0],
+            confidence: None,
+        };
+        let c = estimate_confidence(&depth, 20.0).unwrap();
+        assert!(c[0] > 0.9, "flat valid depth should stay high confidence");
+        assert!(c[1] < c[0], "depth discontinuity should lower confidence");
+        assert!(c[2] < c[0], "edge neighbor should lower confidence");
+
+        let invalid = DepthMap {
+            width: 1,
+            height: 1,
+            depth_m: vec![f32::NAN],
+            confidence: None,
+        };
+        assert_eq!(estimate_confidence(&invalid, 20.0).unwrap()[0], 0.0);
     }
 }

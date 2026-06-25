@@ -6,7 +6,13 @@
 //! single clean plane instead of thousands of jittery triangles.
 //!
 //! This crate starts with the irreducible core — robust least-squares plane
-//! fitting — and grows detection, persistence, and polygonization on top.
+//! fitting via geometric moments — and grows detection, persistence, and
+//! polygonization on top.
+
+mod eigen;
+pub mod moments;
+
+pub use moments::Moments;
 
 use glam::Vec3;
 
@@ -31,71 +37,17 @@ impl Plane {
     }
 }
 
-/// Fit a plane to `points` by total least squares (PCA): the plane through the
-/// centroid whose normal is the covariance eigenvector with the smallest
-/// eigenvalue. Robust to per-point noise because it minimises squared
-/// orthogonal distance over all points. Returns `None` for < 3 points or a
-/// degenerate (collinear) set.
+/// Fit a plane to `points` by total least squares (the covariance eigenvector
+/// with the smallest eigenvalue). Robust to per-point noise because it minimises
+/// squared orthogonal distance over all points. Convenience wrapper over
+/// [`Moments`]; the per-cell/per-segment paths accumulate moments directly
+/// rather than building a point `Vec`.
 pub fn fit_plane(points: &[Vec3]) -> Option<Plane> {
-    if points.len() < 3 {
-        return None;
-    }
-    let n = points.len() as f64;
-    let (mut cx, mut cy, mut cz) = (0.0f64, 0.0, 0.0);
+    let mut m = Moments::new();
     for p in points {
-        cx += p.x as f64;
-        cy += p.y as f64;
-        cz += p.z as f64;
+        m.add_point(1.0, *p);
     }
-    cx /= n;
-    cy /= n;
-    cz /= n;
-
-    // Symmetric covariance.
-    let (mut c00, mut c01, mut c02, mut c11, mut c12, mut c22) = (0.0f64, 0.0, 0.0, 0.0, 0.0, 0.0);
-    for p in points {
-        let (dx, dy, dz) = (p.x as f64 - cx, p.y as f64 - cy, p.z as f64 - cz);
-        c00 += dx * dx;
-        c01 += dx * dy;
-        c02 += dx * dz;
-        c11 += dy * dy;
-        c12 += dy * dz;
-        c22 += dz * dz;
-    }
-
-    // Smallest eigenvector of C = largest eigenvector of M = kI − C
-    // (k chosen so M is well-conditioned). Found by power iteration.
-    let k = c00 + c11 + c22 + 1.0;
-    let m = [
-        [k - c00, -c01, -c02],
-        [-c01, k - c11, -c12],
-        [-c02, -c12, k - c22],
-    ];
-    let mut v = [0.41f64, 0.31, -0.86]; // arbitrary, not axis-aligned
-    for _ in 0..128 {
-        let nv = [
-            m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
-            m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
-            m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
-        ];
-        let len = (nv[0] * nv[0] + nv[1] * nv[1] + nv[2] * nv[2]).sqrt();
-        if len < 1e-12 {
-            return None;
-        }
-        let nv = [nv[0] / len, nv[1] / len, nv[2] / len];
-        let delta = (nv[0] - v[0]).abs() + (nv[1] - v[1]).abs() + (nv[2] - v[2]).abs();
-        v = nv;
-        if delta < 1e-10 {
-            break;
-        }
-    }
-
-    let normal = Vec3::new(v[0] as f32, v[1] as f32, v[2] as f32).normalize();
-    let centroid = Vec3::new(cx as f32, cy as f32, cz as f32);
-    Some(Plane {
-        normal,
-        offset: normal.dot(centroid),
-    })
+    m.fit().map(|(plane, _flatness)| plane)
 }
 
 #[cfg(test)]

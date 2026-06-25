@@ -884,6 +884,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ge-prim"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "glam",
+]
+
+[[package]]
 name = "ge-py"
 version = "0.0.0"
 

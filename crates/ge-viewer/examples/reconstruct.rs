@@ -114,7 +114,9 @@ fn main() -> anyhow::Result<()> {
                 let dm = depth.infer(&frame)?;
                 let intr = assumed_intrinsics(frame.width, frame.height, 65.0);
                 let stride = (frame.width as usize / 256).max(1);
-                Ok(Some(depth_to_mesh(&dm, &intr, stride, 10.0)))
+                // Cap at 5 m: indoor scenes are closer, and far values are noise
+                // that otherwise blow up the view bounds.
+                Ok(Some(depth_to_mesh(&dm, &intr, stride, 5.0)))
             }
             None => Ok(None),
         },

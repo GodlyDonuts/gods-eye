@@ -220,6 +220,33 @@ pub fn view_mesh(mesh: &Mesh, title: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Map a normalized height `t` in `[0,1]` to a Tesla-occupancy-style colour
+/// (deep blue → blue → teal → green → yellow), returned as linear `[r,g,b]`.
+#[cfg(feature = "window")]
+fn tesla_gradient(t: f32) -> [f32; 3] {
+    const STOPS: [(f32, [f32; 3]); 5] = [
+        (0.0, [0.04, 0.10, 0.35]),
+        (0.35, [0.00, 0.45, 0.85]),
+        (0.60, [0.00, 0.80, 0.75]),
+        (0.80, [0.35, 0.85, 0.35]),
+        (1.0, [0.95, 0.85, 0.30]),
+    ];
+    let t = t.clamp(0.0, 1.0);
+    for w in STOPS.windows(2) {
+        let (t0, c0) = w[0];
+        let (t1, c1) = w[1];
+        if t <= t1 {
+            let f = ((t - t0) / (t1 - t0)).clamp(0.0, 1.0);
+            return [
+                c0[0] + (c1[0] - c0[0]) * f,
+                c0[1] + (c1[1] - c0[1]) * f,
+                c0[2] + (c1[2] - c0[2]) * f,
+            ];
+        }
+    }
+    STOPS[STOPS.len() - 1].1
+}
+
 /// Open a 3D window that shows a *live* mesh: `produce` is called every frame
 /// and, whenever it returns a mesh, the displayed geometry is replaced. Orbit
 /// to look around; the camera auto-frames the first mesh. Requires the `window`
@@ -230,9 +257,8 @@ where
     F: FnMut() -> anyhow::Result<Option<Mesh>> + 'static,
 {
     use three_d::{
-        degrees, vec3, AmbientLight, Camera, ClearState, CpuMaterial, CpuMesh, Cull,
-        DirectionalLight, FrameOutput, Gm, Indices, Light, OrbitControl, PhysicalMaterial,
-        Positions, Srgba, Vec3, Window, WindowSettings,
+        degrees, vec3, Camera, ClearState, ColorMaterial, CpuMesh, Cull, FrameOutput, Gm, Indices,
+        OrbitControl, Positions, RenderStates, Srgba, Vec3, Window, WindowSettings,
     };
 
     let window = Window::new(WindowSettings {
@@ -249,19 +275,19 @@ where
         vec3(0.0, 0.0, 1.0),
         vec3(0.0, -1.0, 0.0),
         degrees(50.0),
-        0.05,
-        100.0,
+        0.02,
+        500.0,
     );
-    let mut control = OrbitControl::new(vec3(0.0, 0.0, 1.0), 0.05, 100.0);
-    let light = DirectionalLight::new(&context, 2.0, Srgba::WHITE, vec3(-0.4, -1.0, -0.6));
-    let ambient = AmbientLight::new(&context, 0.6, Srgba::WHITE);
+    let mut control = OrbitControl::new(vec3(0.0, 0.0, 1.0), 0.02, 500.0);
 
-    let mut model: Option<Gm<three_d::Mesh, PhysicalMaterial>> = None;
+    let mut model: Option<Gm<three_d::Mesh, ColorMaterial>> = None;
     let mut framed = false;
+    // Light direction for baked soft shading (world is y-down).
+    let light = [0.35f32, -0.70, -0.62];
 
     window.render_loop(move |mut frame_input| {
         if let Ok(Some(mesh)) = produce() {
-            if !mesh.positions.is_empty() {
+            if mesh.positions.len() > 3 {
                 let positions: Vec<Vec3> = mesh
                     .positions
                     .iter()
@@ -282,45 +308,82 @@ where
                 } else {
                     cpu.compute_normals();
                 }
-                let mut material = PhysicalMaterial::new_opaque(
-                    &context,
-                    &CpuMaterial {
-                        albedo: Srgba::new(180, 185, 195, 255),
-                        roughness: 0.8,
-                        metallic: 0.0,
+
+                // Tesla-style height gradient with soft shading baked per vertex.
+                let (mut ymin, mut ymax) = (f32::MAX, f32::MIN);
+                for p in &mesh.positions {
+                    ymin = ymin.min(p[1]);
+                    ymax = ymax.max(p[1]);
+                }
+                let yr = (ymax - ymin).max(1e-3);
+                let normals = cpu.normals.as_ref();
+                let colors: Vec<Srgba> = mesh
+                    .positions
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| {
+                        let base = tesla_gradient((ymax - p[1]) / yr);
+                        let shade = match normals {
+                            Some(ns) => {
+                                let n = ns[i];
+                                0.4 + 0.6 * (n.x * light[0] + n.y * light[1] + n.z * light[2]).abs()
+                            }
+                            None => 1.0,
+                        };
+                        Srgba::new(
+                            (base[0] * shade * 255.0) as u8,
+                            (base[1] * shade * 255.0) as u8,
+                            (base[2] * shade * 255.0) as u8,
+                            255,
+                        )
+                    })
+                    .collect();
+                cpu.colors = Some(colors);
+
+                let material = ColorMaterial {
+                    color: Srgba::WHITE,
+                    texture: None,
+                    render_states: RenderStates {
+                        cull: Cull::None,
                         ..Default::default()
                     },
-                );
-                // Show both faces: a depth surface's winding may face either way.
-                material.render_states.cull = Cull::None;
+                    is_transparent: false,
+                };
                 model = Some(Gm::new(three_d::Mesh::new(&context, &cpu), material));
 
-                if !framed {
-                    let mut mn = [f32::MAX; 3];
-                    let mut mx = [f32::MIN; 3];
+                if !framed && mesh.positions.len() > 100 {
+                    // Robust framing: centroid + 92nd-percentile radius so far-depth
+                    // outliers don't shrink the scene to a tiny box.
+                    let n = mesh.positions.len() as f32;
+                    let (mut cx, mut cy, mut cz) = (0.0f32, 0.0f32, 0.0f32);
                     for p in &mesh.positions {
-                        for i in 0..3 {
-                            mn[i] = mn[i].min(p[i]);
-                            mx[i] = mx[i].max(p[i]);
-                        }
+                        cx += p[0];
+                        cy += p[1];
+                        cz += p[2];
                     }
-                    let center = vec3(
-                        (mn[0] + mx[0]) * 0.5,
-                        (mn[1] + mx[1]) * 0.5,
-                        (mn[2] + mx[2]) * 0.5,
-                    );
-                    let (dx, dy, dz) = (mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]);
-                    let ext = (dx * dx + dy * dy + dz * dz).sqrt().max(0.2);
+                    let center = vec3(cx / n, cy / n, cz / n);
+                    let mut dists: Vec<f32> = mesh
+                        .positions
+                        .iter()
+                        .map(|p| {
+                            let (dx, dy, dz) = (p[0] - center.x, p[1] - center.y, p[2] - center.z);
+                            (dx * dx + dy * dy + dz * dz).sqrt()
+                        })
+                        .collect();
+                    dists.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let radius =
+                        dists[((dists.len() as f32 * 0.92) as usize).min(dists.len() - 1)].max(0.1);
+                    let dist = radius / (25.0f32.to_radians().tan()) * 1.2;
                     camera = Camera::new_perspective(
                         frame_input.viewport,
-                        center + vec3(0.0, 0.0, -ext * 1.2),
+                        center + vec3(0.0, 0.0, -dist),
                         center,
                         vec3(0.0, -1.0, 0.0),
                         degrees(50.0),
-                        ext * 0.01,
-                        ext * 20.0,
+                        (dist * 0.02).max(0.01),
+                        dist * 20.0 + 50.0,
                     );
-                    control = OrbitControl::new(center, ext * 0.03, ext * 10.0);
+                    control = OrbitControl::new(center, radius * 0.2, dist * 6.0);
                     framed = true;
                 }
             }
@@ -330,12 +393,8 @@ where
         control.handle_events(&mut camera, &mut frame_input.events);
         frame_input
             .screen()
-            .clear(ClearState::color_and_depth(0.08, 0.09, 0.11, 1.0, 1.0))
-            .render(
-                &camera,
-                model.as_ref(),
-                &[&light as &dyn Light, &ambient as &dyn Light],
-            );
+            .clear(ClearState::color_and_depth(0.02, 0.03, 0.06, 1.0, 1.0))
+            .render(&camera, model.as_ref(), &[] as &[&dyn three_d::Light]);
         FrameOutput::default()
     });
 

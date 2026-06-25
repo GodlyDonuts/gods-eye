@@ -9,7 +9,7 @@
 //!   python3 tools/export_metric_onnx.py            # writes models/dav2_metric_indoor_392.onnx
 //!   python3 tools/export_metric_onnx.py '' 252     # faster 252 variant
 //!   cargo run --release -p ge-viewer --example reconstruct --features reconstruct
-//!   cargo run --release -p ge-viewer --example reconstruct --features reconstruct -- iPhone models/dav2_metric_indoor_252.onnx
+//!   cargo run --release -p ge-viewer --example reconstruct --features reconstruct -- 1   # camera index 1 (e.g. iPhone)
 
 use ge_backend_trait::{DepthBackend, DepthMap, Intrinsics};
 use ge_mesh::Mesh;
@@ -84,9 +84,7 @@ fn depth_to_mesh(depth: &DepthMap, intr: &Intrinsics, stride: usize, max_depth: 
 }
 
 fn main() -> anyhow::Result<()> {
-    let name = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "iPhone".to_string());
+    let cam = std::env::args().nth(1);
     let model = std::env::args()
         .nth(2)
         .unwrap_or_else(|| "models/dav2_metric_indoor_252.onnx".to_string());
@@ -97,8 +95,14 @@ fn main() -> anyhow::Result<()> {
             println!("  [{}] {}", d.index, d.name);
         }
     }
-    let mut camera =
-        ge_viewer::WebcamSource::open_named(&name).or_else(|_| ge_viewer::WebcamSource::open(0))?;
+    // Accept a numeric index (e.g. `1` for the iPhone) or a name substring.
+    let mut camera = match cam.as_deref() {
+        None => ge_viewer::WebcamSource::open(0)?,
+        Some(s) => match s.parse::<u32>() {
+            Ok(index) => ge_viewer::WebcamSource::open(index)?,
+            Err(_) => ge_viewer::WebcamSource::open_named(s)?,
+        },
+    };
 
     println!("loading metric depth model: {model}");
     let mut depth = ge_depth::OrtDepth::new_with_size(&model, ge_depth::Accel::Cpu, 252)?;

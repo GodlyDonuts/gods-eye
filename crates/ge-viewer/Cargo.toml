@@ -24,6 +24,9 @@ reconstruct = [
     "dep:ge-fusion",
     "dep:ge-slam",
 ]
+# 2D panorama: track camera rotation and stitch frames onto a canvas. Isolates
+# the motion-tracking problem from depth/3D.
+panorama = ["window", "camera", "dep:ge-slam"]
 
 [dependencies]
 ge-backend-trait.workspace = true
@@ -47,3 +50,7 @@ required-features = ["window", "camera"]
 [[example]]
 name = "reconstruct"
 required-features = ["reconstruct"]
+
+[[example]]
+name = "panorama"
+required-features = ["panorama"]

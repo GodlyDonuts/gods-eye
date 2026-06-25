@@ -283,6 +283,107 @@ impl RgbdVoTracker {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 2D image-translation tracking (for panorama / rotation development).
+//
+// Tracking camera rotation in the image plane (a panorama) isolates the
+// motion-estimation problem from depth/3D. A pure pan/tilt of the camera moves
+// image content by a 2D translation; pyramidal Lucas-Kanade recovers it.
+// ---------------------------------------------------------------------------
+
+/// Bilinear sample of a single-channel image at floating `(x, y)` (clamped).
+fn sample_bilinear(img: &[f32], w: usize, h: usize, x: f32, y: f32) -> f32 {
+    let x = x.clamp(0.0, (w - 1) as f32);
+    let y = y.clamp(0.0, (h - 1) as f32);
+    let (x0, y0) = (x.floor() as usize, y.floor() as usize);
+    let (x1, y1) = ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1));
+    let (fx, fy) = (x - x0 as f32, y - y0 as f32);
+    let top = img[y0 * w + x0] + (img[y0 * w + x1] - img[y0 * w + x0]) * fx;
+    let bot = img[y1 * w + x0] + (img[y1 * w + x1] - img[y1 * w + x0]) * fx;
+    top + (bot - top) * fy
+}
+
+fn downsample2(img: &[f32], w: usize, h: usize) -> (Vec<f32>, usize, usize) {
+    let (nw, nh) = ((w / 2).max(1), (h / 2).max(1));
+    let mut out = vec![0.0f32; nw * nh];
+    for y in 0..nh {
+        for x in 0..nw {
+            let (x0, y0) = (2 * x, 2 * y);
+            let (x1, y1) = ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1));
+            out[y * nw + x] =
+                0.25 * (img[y0 * w + x0] + img[y0 * w + x1] + img[y1 * w + x0] + img[y1 * w + x1]);
+        }
+    }
+    (out, nw, nh)
+}
+
+fn pyramid(img: &[f32], w: usize, h: usize) -> Vec<(Vec<f32>, usize, usize)> {
+    let mut levels = vec![(img.to_vec(), w, h)];
+    while levels.len() < 5 {
+        let (ref im, cw, ch) = *levels.last().unwrap();
+        if cw <= 48 || ch <= 48 {
+            break;
+        }
+        let (d, nw, nh) = downsample2(im, cw, ch);
+        levels.push((d, nw, nh));
+    }
+    levels
+}
+
+/// Estimate the 2D translation `(dx, dy)` such that `cur(x, y) ≈ prev(x-dx, y-dy)`
+/// via pyramidal Lucas-Kanade. Inputs are single-channel intensities.
+pub fn estimate_translation(prev: &[f32], cur: &[f32], width: usize, height: usize) -> (f32, f32) {
+    let pp = pyramid(prev, width, height);
+    let pc = pyramid(cur, width, height);
+    let n = pp.len();
+    let (mut dx, mut dy) = (0.0f32, 0.0f32);
+    for li in (0..n).rev() {
+        if li != n - 1 {
+            dx *= 2.0;
+            dy *= 2.0;
+        }
+        let (ref p, pw, ph) = pp[li];
+        let c = &pc[li].0;
+        for _ in 0..12 {
+            let (mut g00, mut g01, mut g11, mut b0, mut b1) = (0.0f64, 0.0, 0.0, 0.0, 0.0);
+            for y in 1..ph.saturating_sub(1) {
+                for x in 1..pw.saturating_sub(1) {
+                    let (sx, sy) = (x as f32 - dx, y as f32 - dy);
+                    if sx < 1.0 || sy < 1.0 || sx > (pw - 2) as f32 || sy > (ph - 2) as f32 {
+                        continue;
+                    }
+                    let pv = sample_bilinear(p, pw, ph, sx, sy);
+                    let r = (c[y * pw + x] - pv) as f64;
+                    let gx = ((sample_bilinear(p, pw, ph, sx + 1.0, sy)
+                        - sample_bilinear(p, pw, ph, sx - 1.0, sy))
+                        * 0.5) as f64;
+                    let gy = ((sample_bilinear(p, pw, ph, sx, sy + 1.0)
+                        - sample_bilinear(p, pw, ph, sx, sy - 1.0))
+                        * 0.5) as f64;
+                    g00 += gx * gx;
+                    g01 += gx * gy;
+                    g11 += gy * gy;
+                    b0 += gx * r;
+                    b1 += gy * r;
+                }
+            }
+            let det = g00 * g11 - g01 * g01;
+            if det.abs() < 1e-9 {
+                break;
+            }
+            // δ = -G⁻¹ b
+            let ddx = -(g11 * b0 - g01 * b1) / det;
+            let ddy = -(-g01 * b0 + g00 * b1) / det;
+            dx += ddx as f32;
+            dy += ddy as f32;
+            if ddx.abs() + ddy.abs() < 1e-3 {
+                break;
+            }
+        }
+    }
+    (dx, dy)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,6 +473,31 @@ mod tests {
             pose.translation.length() < 0.02,
             "static-scene drift too high: {}",
             pose.translation.length()
+        );
+    }
+
+    #[test]
+    fn lk_recovers_known_shift() {
+        let (w, h) = (160usize, 120usize);
+        let mut prev = vec![0.0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                // 2D texture (gradients in both axes) for observability.
+                prev[y * w + x] =
+                    (0.5 + 0.5 * (x as f32 * 0.3).sin() * (y as f32 * 0.27).cos()).clamp(0.0, 1.0);
+            }
+        }
+        let (kx, ky) = (3.0f32, -2.0f32);
+        let mut cur = vec![0.0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                cur[y * w + x] = sample_bilinear(&prev, w, h, x as f32 - kx, y as f32 - ky);
+            }
+        }
+        let (dx, dy) = estimate_translation(&prev, &cur, w, h);
+        assert!(
+            (dx - kx).abs() < 0.4 && (dy - ky).abs() < 0.4,
+            "recovered ({dx}, {dy}), expected ({kx}, {ky})"
         );
     }
 }

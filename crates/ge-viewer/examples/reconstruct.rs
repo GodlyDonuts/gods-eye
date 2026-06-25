@@ -1,22 +1,18 @@
-//! Live single-view 3D reconstruction from a camera.
+//! Live 3D reconstruction with visual odometry.
 //!
-//! camera → metric depth (DAv2 metric ONNX) → per-pixel unprojected surface
-//! mesh, shown live in a 3D window. Single viewpoint with identity pose (no
-//! cross-frame fusion yet — that needs visual odometry), so it's a live, metric
-//! "depth relief" of whatever the camera sees. Orbit with the mouse.
+//! camera → metric depth → frame-to-frame VO (point-to-plane ICP) → a persistent
+//! TSDF fused at the tracked pose → surface mesh, shown live. Turn or move and
+//! the room accumulates in one fixed world frame; turn back and the earlier
+//! geometry is still there (rotated into view). VO is dead-reckoning for now, so
+//! it drifts over long runs — best for "recent" backtracking.
 //!
-//! Run in release for smooth depth, and export the metric model first:
-//!   python3 tools/export_metric_onnx.py            # writes models/dav2_metric_indoor_392.onnx
-//!   python3 tools/export_metric_onnx.py '' 252     # faster 252 variant
-//!   cargo run --release -p ge-viewer --example reconstruct --features reconstruct
-//!   cargo run --release -p ge-viewer --example reconstruct --features reconstruct -- 1   # camera index 1 (e.g. iPhone)
+//! Run in release (depth + fusion are CPU-heavy), and export the metric model
+//! first (`python3 tools/export_metric_onnx.py '' 252`):
+//!   cargo run --release -p ge-viewer --example reconstruct --features reconstruct -- 1
 
 use ge_backend_trait::{DepthBackend, DepthMap, Intrinsics};
-use ge_mesh::Mesh;
 
-/// Pinhole intrinsics from an assumed horizontal field of view (square pixels).
-/// The webcam doesn't report intrinsics, so x/y scale is approximate; depth (z)
-/// is metric from the model.
+/// Pinhole intrinsics from an assumed horizontal FOV (the webcam reports none).
 fn assumed_intrinsics(width: u32, height: u32, hfov_deg: f32) -> Intrinsics {
     let fx = (width as f32 * 0.5) / (hfov_deg.to_radians() * 0.5).tan();
     Intrinsics {
@@ -29,58 +25,30 @@ fn assumed_intrinsics(width: u32, height: u32, hfov_deg: f32) -> Intrinsics {
     }
 }
 
-/// Unproject a subsampled metric depth map into a triangle surface mesh. Quads
-/// spanning a large depth discontinuity are dropped to avoid stretched
-/// triangles across occlusion edges.
-fn depth_to_mesh(depth: &DepthMap, intr: &Intrinsics, stride: usize, max_depth: f32) -> Mesh {
-    let w = depth.width as usize;
-    let h = depth.height as usize;
-    let cols = (w / stride).max(1);
-    let rows = (h / stride).max(1);
-
-    let mut positions: Vec<[f32; 3]> = Vec::new();
-    let mut idx = vec![u32::MAX; cols * rows];
-    let mut zs = vec![0.0f32; cols * rows];
-    for gv in 0..rows {
-        for gu in 0..cols {
-            let (u, v) = (gu * stride, gv * stride);
-            let d = depth.depth_m[v * w + u];
-            if d.is_finite() && d > 0.1 && d < max_depth {
-                let p = intr.unproject(u as f32, v as f32, d);
-                idx[gv * cols + gu] = positions.len() as u32;
-                zs[gv * cols + gu] = d;
-                positions.push([p.x, p.y, p.z]);
-            }
+/// Downsample a depth map to `target_w` (nearest) with matching assumed
+/// intrinsics — keeps VO + fusion fast regardless of camera resolution.
+fn downsample(src: &DepthMap, target_w: u32, hfov_deg: f32) -> (DepthMap, Intrinsics) {
+    let (sw, sh) = (src.width as usize, src.height as usize);
+    let tw = (target_w as usize).max(1);
+    let th = (sh * tw / sw).max(1);
+    let mut depth_m = vec![0.0f32; tw * th];
+    for ty in 0..th {
+        let sy = ty * sh / th;
+        for tx in 0..tw {
+            let sx = tx * sw / tw;
+            depth_m[ty * tw + tx] = src.depth_m[sy * sw + sx];
         }
     }
-
-    let mut indices: Vec<u32> = Vec::new();
-    for gv in 0..rows.saturating_sub(1) {
-        for gu in 0..cols.saturating_sub(1) {
-            let a = idx[gv * cols + gu];
-            let b = idx[gv * cols + gu + 1];
-            let c = idx[(gv + 1) * cols + gu];
-            let e = idx[(gv + 1) * cols + gu + 1];
-            if a == u32::MAX || b == u32::MAX || c == u32::MAX || e == u32::MAX {
-                continue;
-            }
-            let za = zs[gv * cols + gu];
-            let zb = zs[gv * cols + gu + 1];
-            let zc = zs[(gv + 1) * cols + gu];
-            let ze = zs[(gv + 1) * cols + gu + 1];
-            let (zmax, zmin) = (za.max(zb).max(zc).max(ze), za.min(zb).min(zc).min(ze));
-            if zmax - zmin > 0.05 * zmax {
-                continue; // occlusion edge
-            }
-            indices.extend_from_slice(&[a, c, b, b, c, e]);
-        }
-    }
-
-    Mesh {
-        positions,
-        normals: Vec::new(),
-        indices,
-    }
+    let intr = assumed_intrinsics(tw as u32, th as u32, hfov_deg);
+    (
+        DepthMap {
+            width: tw as u32,
+            height: th as u32,
+            depth_m,
+            confidence: None,
+        },
+        intr,
+    )
 }
 
 fn main() -> anyhow::Result<()> {
@@ -95,7 +63,6 @@ fn main() -> anyhow::Result<()> {
             println!("  [{}] {}", d.index, d.name);
         }
     }
-    // Accept a numeric index (e.g. `1` for the iPhone) or a name substring.
     let mut camera = match cam.as_deref() {
         None => ge_viewer::WebcamSource::open(0)?,
         Some(s) => match s.parse::<u32>() {
@@ -106,20 +73,34 @@ fn main() -> anyhow::Result<()> {
 
     println!("loading metric depth model: {model}");
     let mut depth = ge_depth::OrtDepth::new_with_size(&model, ge_depth::Accel::Cpu, 252)?;
-    println!("reconstructing — orbit with the mouse…");
 
+    // Persistent world TSDF: a ~4 x 4 x 4 m volume in front of the start point.
+    let voxel = 0.04f32;
+    let mut tsdf = ge_fusion::Tsdf::new([100, 100, 98], voxel, [-2.0, -2.0, 0.1], 4.0 * voxel);
+    let mut vo: Option<ge_slam::RgbdVoTracker> = None;
+    let mut frame_i = 0usize;
+
+    println!("reconstructing — move/turn slowly; orbit the result with the mouse…");
     ge_viewer::view_meshes(
-        move || match camera.next_frame()? {
-            Some(frame) => {
-                let dm = depth.infer(&frame)?;
-                let intr = assumed_intrinsics(frame.width, frame.height, 65.0);
-                let stride = (frame.width as usize / 256).max(1);
-                // Cap at 5 m: indoor scenes are closer, and far values are noise
-                // that otherwise blow up the view bounds.
-                Ok(Some(depth_to_mesh(&dm, &intr, stride, 5.0)))
+        move || {
+            let frame = match camera.next_frame()? {
+                Some(f) => f,
+                None => return Ok(None),
+            };
+            let dm_full = depth.infer(&frame)?;
+            let (dm, intr) = downsample(&dm_full, 160, 65.0);
+            let tracker = vo.get_or_insert_with(|| ge_slam::RgbdVoTracker::new(intr));
+            let pose = tracker.track(&dm);
+            tsdf.integrate(&dm, &intr, &pose);
+            frame_i += 1;
+            // Re-mesh on a slower cadence than tracking (extraction is the
+            // expensive step); the TSDF keeps accumulating every frame.
+            if frame_i % 4 == 0 {
+                Ok(Some(tsdf.extract_mesh()))
+            } else {
+                Ok(None)
             }
-            None => Ok(None),
         },
-        "Gods Eye — live 3D",
+        "Gods Eye — live 3D (VO)",
     )
 }

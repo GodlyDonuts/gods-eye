@@ -904,7 +904,9 @@ dependencies = [
  "bytemuck",
  "ge-backend-trait",
  "ge-depth",
+ "ge-fusion",
  "ge-mesh",
+ "ge-slam",
  "nokhwa",
  "three-d",
 ]

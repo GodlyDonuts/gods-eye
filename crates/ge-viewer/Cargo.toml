@@ -14,13 +14,23 @@ default = []
 window = ["dep:three-d", "dep:bytemuck"]
 # Webcam capture source (nokhwa). Off by default; pulls native camera bindings.
 camera = ["dep:nokhwa"]
-# Live single-view 3D reconstruction example (camera -> metric depth -> mesh).
-reconstruct = ["window", "camera", "dep:ge-depth", "ge-depth/onnx"]
+# Live 3D reconstruction example: camera -> metric depth -> visual odometry ->
+# persistent TSDF -> mesh.
+reconstruct = [
+    "window",
+    "camera",
+    "dep:ge-depth",
+    "ge-depth/onnx",
+    "dep:ge-fusion",
+    "dep:ge-slam",
+]
 
 [dependencies]
 ge-backend-trait.workspace = true
 ge-mesh.workspace = true
 ge-depth = { workspace = true, optional = true }
+ge-fusion = { workspace = true, optional = true }
+ge-slam = { workspace = true, optional = true }
 anyhow.workspace = true
 three-d = { version = "0.19", optional = true }
 nokhwa = { version = "0.10", features = ["input-native"], optional = true }

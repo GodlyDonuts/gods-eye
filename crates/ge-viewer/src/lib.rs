@@ -220,33 +220,6 @@ pub fn view_mesh(mesh: &Mesh, title: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Map a normalized height `t` in `[0,1]` to a Tesla-occupancy-style colour
-/// (deep blue → blue → teal → green → yellow), returned as linear `[r,g,b]`.
-#[cfg(feature = "window")]
-fn tesla_gradient(t: f32) -> [f32; 3] {
-    const STOPS: [(f32, [f32; 3]); 5] = [
-        (0.0, [0.04, 0.10, 0.35]),
-        (0.35, [0.00, 0.45, 0.85]),
-        (0.60, [0.00, 0.80, 0.75]),
-        (0.80, [0.35, 0.85, 0.35]),
-        (1.0, [0.95, 0.85, 0.30]),
-    ];
-    let t = t.clamp(0.0, 1.0);
-    for w in STOPS.windows(2) {
-        let (t0, c0) = w[0];
-        let (t1, c1) = w[1];
-        if t <= t1 {
-            let f = ((t - t0) / (t1 - t0)).clamp(0.0, 1.0);
-            return [
-                c0[0] + (c1[0] - c0[0]) * f,
-                c0[1] + (c1[1] - c0[1]) * f,
-                c0[2] + (c1[2] - c0[2]) * f,
-            ];
-        }
-    }
-    STOPS[STOPS.len() - 1].1
-}
-
 /// Open a 3D window that shows a *live* mesh: `produce` is called every frame
 /// and, whenever it returns a mesh, the displayed geometry is replaced. Orbit
 /// to look around; the camera auto-frames the first mesh. Requires the `window`
@@ -309,31 +282,24 @@ where
                     cpu.compute_normals();
                 }
 
-                // Tesla-style height gradient with soft shading baked per vertex.
-                let (mut ymin, mut ymax) = (f32::MAX, f32::MIN);
-                for p in &mesh.positions {
-                    ymin = ymin.min(p[1]);
-                    ymax = ymax.max(p[1]);
-                }
-                let yr = (ymax - ymin).max(1e-3);
+                // Sleek neutral-gray surface; form read entirely from soft
+                // shading baked per vertex (Tesla-style monochrome occupancy).
+                const BASE: [f32; 3] = [0.66, 0.68, 0.72];
                 let normals = cpu.normals.as_ref();
-                let colors: Vec<Srgba> = mesh
-                    .positions
-                    .iter()
-                    .enumerate()
-                    .map(|(i, p)| {
-                        let base = tesla_gradient((ymax - p[1]) / yr);
+                let colors: Vec<Srgba> = (0..mesh.positions.len())
+                    .map(|i| {
                         let shade = match normals {
                             Some(ns) => {
                                 let n = ns[i];
-                                0.4 + 0.6 * (n.x * light[0] + n.y * light[1] + n.z * light[2]).abs()
+                                0.30 + 0.70
+                                    * (n.x * light[0] + n.y * light[1] + n.z * light[2]).abs()
                             }
                             None => 1.0,
                         };
                         Srgba::new(
-                            (base[0] * shade * 255.0) as u8,
-                            (base[1] * shade * 255.0) as u8,
-                            (base[2] * shade * 255.0) as u8,
+                            (BASE[0] * shade * 255.0) as u8,
+                            (BASE[1] * shade * 255.0) as u8,
+                            (BASE[2] * shade * 255.0) as u8,
                             255,
                         )
                     })

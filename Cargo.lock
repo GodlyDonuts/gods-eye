@@ -907,6 +907,7 @@ dependencies = [
  "ge-fusion",
  "ge-mesh",
  "ge-slam",
+ "glam",
  "nokhwa",
  "three-d",
 ]

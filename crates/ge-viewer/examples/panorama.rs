@@ -1,15 +1,16 @@
 //! Live 2D panorama — develops camera-rotation tracking in isolation.
 //!
-//! Each frame's 2D motion (a pan/tilt of the camera) is estimated with
-//! Lucas-Kanade and accumulated; the frame is pasted onto a large canvas at the
-//! tracked offset. Pan around and the canvas fills out; pan back and what you
-//! already captured is still there. No depth, no 3D — just the tracking, so we
-//! can make the "backtracking" solid before re-introducing reconstruction.
+//! Each frame's 2D motion is estimated with Lucas-Kanade as a *rigid* transform
+//! (in-plane rotation + translation), so camera roll is detected and corrected,
+//! and accumulated into a canvas transform. Frames are warp-pasted onto a large
+//! canvas; pan/roll around and it fills out, pan back and what you captured is
+//! still there — aligned. No depth/3D, just the tracking.
 //!
 //! Run in release:
 //!   cargo run --release -p ge-viewer --example panorama --features panorama -- 1
 
 use ge_backend_trait::Frame;
+use glam::{Affine2, Vec2};
 
 /// Downsample a frame to `target_w` and return (w, h, RGB8, grayscale[0,1]).
 fn to_working(frame: &Frame, target_w: u32) -> (usize, usize, Vec<u8>, Vec<f32>) {
@@ -54,9 +55,10 @@ fn main() -> anyhow::Result<()> {
     let (cw, ch) = (2400usize, 1000usize);
     let mut canvas = vec![16u8; cw * ch * 3]; // near-black background
     let mut prev_gray: Option<(Vec<f32>, usize, usize)> = None;
-    let (mut ox, mut oy) = (cw as f32 * 0.5, ch as f32 * 0.5);
+    // Maps current-frame pixel coords -> canvas pixel coords (accumulated).
+    let mut canvas_from_cur: Option<Affine2> = None;
 
-    println!("panorama — pan slowly to build it, pan back to revisit…");
+    println!("panorama — pan/roll slowly to build it, return to revisit…");
     ge_viewer::view_frames(
         move || {
             let frame = match camera.next_frame()? {
@@ -64,38 +66,58 @@ fn main() -> anyhow::Result<()> {
                 None => return Ok(None),
             };
             let (tw, th, rgb, gray) = to_working(&frame, 240);
+            let frame_center = Vec2::new(tw as f32 * 0.5, th as f32 * 0.5);
+
+            // Initialize the canvas transform: place the first frame centered.
+            let mut m = *canvas_from_cur.get_or_insert_with(|| {
+                Affine2::from_translation(
+                    Vec2::new(cw as f32 * 0.5, ch as f32 * 0.5) - frame_center,
+                )
+            });
 
             if let Some((pg, pw, ph)) = prev_gray.as_ref() {
                 if *pw == tw && *ph == th {
-                    let (dx, dy) = ge_slam::estimate_translation(pg, &gray, tw, th);
-                    // Reject implausible jumps (tracking loss on fast motion).
-                    let max_step = tw as f32 * 0.4;
-                    if dx.abs() < max_step && dy.abs() < max_step {
-                        // Camera pan is opposite to image-content motion.
-                        ox = (ox - dx).clamp(tw as f32 * 0.5, cw as f32 - tw as f32 * 0.5);
-                        oy = (oy - dy).clamp(th as f32 * 0.5, ch as f32 - th as f32 * 0.5);
+                    let rel = ge_slam::estimate_rigid2d(pg, &gray, tw, th); // prev_from_cur
+                                                                            // Reject implausible motion (tracking loss on fast moves).
+                    let moved = (rel.transform_point2(frame_center) - frame_center).length();
+                    let angle = rel.matrix2.x_axis.y.atan2(rel.matrix2.x_axis.x).abs();
+                    if moved < tw as f32 * 0.4 && angle < 0.4 {
+                        m *= rel;
+                        canvas_from_cur = Some(m);
                     }
                 }
             }
 
-            // Paste the current frame onto the canvas at the tracked offset.
-            let left = (ox - tw as f32 * 0.5).round() as i32;
-            let top = (oy - th as f32 * 0.5).round() as i32;
-            for y in 0..th {
-                let cy = top + y as i32;
-                if cy < 0 || cy >= ch as i32 {
-                    continue;
-                }
-                for x in 0..tw {
-                    let cx = left + x as i32;
-                    if cx < 0 || cx >= cw as i32 {
-                        continue;
+            // Warp-paste the current frame onto the canvas (inverse warp so a
+            // rolled frame fills without holes).
+            let cur_from_canvas = m.inverse();
+            let corners = [
+                m.transform_point2(Vec2::new(0.0, 0.0)),
+                m.transform_point2(Vec2::new(tw as f32, 0.0)),
+                m.transform_point2(Vec2::new(0.0, th as f32)),
+                m.transform_point2(Vec2::new(tw as f32, th as f32)),
+            ];
+            let (mut minx, mut miny, mut maxx, mut maxy) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+            for c in corners {
+                minx = minx.min(c.x);
+                miny = miny.min(c.y);
+                maxx = maxx.max(c.x);
+                maxy = maxy.max(c.y);
+            }
+            let x0 = (minx.floor() as i32).clamp(0, cw as i32);
+            let x1 = (maxx.ceil() as i32).clamp(0, cw as i32);
+            let y0 = (miny.floor() as i32).clamp(0, ch as i32);
+            let y1 = (maxy.ceil() as i32).clamp(0, ch as i32);
+            for cy in y0..y1 {
+                for cx in x0..x1 {
+                    let src = cur_from_canvas.transform_point2(Vec2::new(cx as f32, cy as f32));
+                    if src.x >= 0.0 && src.y >= 0.0 && src.x < tw as f32 && src.y < th as f32 {
+                        let si = ((src.y as usize) * tw + src.x as usize) * 3;
+                        let di = ((cy as usize) * cw + cx as usize) * 3;
+                        canvas[di] = rgb[si];
+                        canvas[di + 1] = rgb[si + 1];
+                        canvas[di + 2] = rgb[si + 2];
                     }
-                    let di = ((cy as usize) * cw + cx as usize) * 3;
-                    let si = (y * tw + x) * 3;
-                    canvas[di] = rgb[si];
-                    canvas[di + 1] = rgb[si + 1];
-                    canvas[di + 2] = rgb[si + 2];
                 }
             }
 

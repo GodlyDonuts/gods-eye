@@ -10,7 +10,7 @@
 //! [`IdentityPose`] remains for the M0 spine.
 
 use ge_backend_trait::{DepthMap, Frame, Intrinsics, Pose, PoseEstimator};
-use glam::{Affine3A, Quat, Vec3};
+use glam::{Affine2, Affine3A, Quat, Vec2, Vec3};
 
 /// A trivial pose estimator that always reports the identity (camera fixed at
 /// the origin). Lets fusion run on a static scene.
@@ -384,6 +384,95 @@ pub fn estimate_translation(prev: &[f32], cur: &[f32], width: usize, height: usi
     (dx, dy)
 }
 
+/// Solve the 3×3 system `A x = b` via Cramer's rule. `None` if near-singular.
+fn solve3(a: [[f64; 3]; 3], b: [f64; 3]) -> Option<[f64; 3]> {
+    let det3 = |m: &[[f64; 3]; 3]| {
+        m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+            - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+    };
+    let det = det3(&a);
+    if det.abs() < 1e-12 {
+        return None;
+    }
+    let mut x = [0.0f64; 3];
+    for k in 0..3 {
+        let mut m = a;
+        for (r, &bv) in b.iter().enumerate() {
+            m[r][k] = bv;
+        }
+        x[k] = det3(&m) / det;
+    }
+    Some(x)
+}
+
+/// Estimate a 2D rigid transform (in-plane rotation + translation) `prev_from_cur`
+/// such that `cur(x) ≈ prev(M·x)`, via pyramidal Lucas-Kanade. Handles the
+/// camera rolling about its optical axis, which translation-only tracking can't.
+pub fn estimate_rigid2d(prev: &[f32], cur: &[f32], width: usize, height: usize) -> Affine2 {
+    let pp = pyramid(prev, width, height);
+    let pc = pyramid(cur, width, height);
+    let n = pp.len();
+    let (mut theta, mut tx, mut ty) = (0.0f32, 0.0f32, 0.0f32);
+    for li in (0..n).rev() {
+        if li != n - 1 {
+            tx *= 2.0;
+            ty *= 2.0; // angle is scale-invariant
+        }
+        let (ref p, pw, ph) = pp[li];
+        let c = &pc[li].0;
+        let (cx, cy) = ((pw as f32 - 1.0) * 0.5, (ph as f32 - 1.0) * 0.5);
+        for _ in 0..12 {
+            let (s, co) = (theta.sin(), theta.cos());
+            let mut h = [[0.0f64; 3]; 3];
+            let mut bb = [0.0f64; 3];
+            for y in 1..ph.saturating_sub(1) {
+                for x in 1..pw.saturating_sub(1) {
+                    let (xc, yc) = (x as f32 - cx, y as f32 - cy);
+                    // W(x) = R(theta)*(xc, yc) + (cx + tx, cy + ty)
+                    let wx = co * xc - s * yc + cx + tx;
+                    let wy = s * xc + co * yc + cy + ty;
+                    if wx < 1.0 || wy < 1.0 || wx > (pw - 2) as f32 || wy > (ph - 2) as f32 {
+                        continue;
+                    }
+                    let pv = sample_bilinear(p, pw, ph, wx, wy);
+                    let r = (c[y * pw + x] - pv) as f64;
+                    let gx = ((sample_bilinear(p, pw, ph, wx + 1.0, wy)
+                        - sample_bilinear(p, pw, ph, wx - 1.0, wy))
+                        * 0.5) as f64;
+                    let gy = ((sample_bilinear(p, pw, ph, wx, wy + 1.0)
+                        - sample_bilinear(p, pw, ph, wx, wy - 1.0))
+                        * 0.5) as f64;
+                    // dW/dtheta = R'(theta)*(xc, yc)
+                    let dwt_x = (-s * xc - co * yc) as f64;
+                    let dwt_y = (co * xc - s * yc) as f64;
+                    let sd = [gx * dwt_x + gy * dwt_y, gx, gy];
+                    for rr in 0..3 {
+                        bb[rr] += sd[rr] * r;
+                        for cc in 0..3 {
+                            h[rr][cc] += sd[rr] * sd[cc];
+                        }
+                    }
+                }
+            }
+            for k in 0..3 {
+                h[k][k] += 1e-9;
+            }
+            let Some(d) = solve3(h, bb) else { break };
+            theta += d[0] as f32;
+            tx += d[1] as f32;
+            ty += d[2] as f32;
+            if d[0].abs() + d[1].abs() + d[2].abs() < 1e-4 {
+                break;
+            }
+        }
+    }
+    let c = Vec2::new((width as f32 - 1.0) * 0.5, (height as f32 - 1.0) * 0.5);
+    Affine2::from_translation(c + Vec2::new(tx, ty))
+        * Affine2::from_angle(theta)
+        * Affine2::from_translation(-c)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,5 +588,35 @@ mod tests {
             (dx - kx).abs() < 0.4 && (dy - ky).abs() < 0.4,
             "recovered ({dx}, {dy}), expected ({kx}, {ky})"
         );
+    }
+
+    #[test]
+    fn lk_rigid_recovers_rotation_and_shift() {
+        let (w, h) = (160usize, 120usize);
+        let mut prev = vec![0.0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                prev[y * w + x] =
+                    (0.5 + 0.5 * (x as f32 * 0.21).sin() * (y as f32 * 0.19).cos()).clamp(0.0, 1.0);
+            }
+        }
+        let c = Vec2::new((w as f32 - 1.0) * 0.5, (h as f32 - 1.0) * 0.5);
+        let (theta_k, tx_k, ty_k) = (0.06f32, 4.0f32, -3.0f32);
+        let m = Affine2::from_translation(c + Vec2::new(tx_k, ty_k))
+            * Affine2::from_angle(theta_k)
+            * Affine2::from_translation(-c);
+        let mut cur = vec![0.0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let p = m.transform_point2(Vec2::new(x as f32, y as f32));
+                cur[y * w + x] = sample_bilinear(&prev, w, h, p.x, p.y);
+            }
+        }
+        let est = estimate_rigid2d(&prev, &cur, w, h);
+        for &(px, py) in &[(20.0f32, 20.0f32), (140.0, 30.0), (80.0, 100.0)] {
+            let a = m.transform_point2(Vec2::new(px, py));
+            let b = est.transform_point2(Vec2::new(px, py));
+            assert!((a - b).length() < 1.2, "rigid mismatch at ({px},{py})");
+        }
     }
 }

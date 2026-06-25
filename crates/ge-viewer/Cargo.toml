@@ -34,6 +34,7 @@ ge-mesh.workspace = true
 ge-depth = { workspace = true, optional = true }
 ge-fusion = { workspace = true, optional = true }
 ge-slam = { workspace = true, optional = true }
+glam.workspace = true
 anyhow.workspace = true
 three-d = { version = "0.19", optional = true }
 nokhwa = { version = "0.10", features = ["input-native"], optional = true }

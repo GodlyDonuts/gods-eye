@@ -1,6 +1,6 @@
 [package]
 name = "ge-prim"
-description = "Low-poly primitive reconstruction: robust plane fitting, detection, polygonization."
+description = "Low-poly primitive reconstruction: robust plane fitting, detection, persistence, polygonization."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,5 +8,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+ge-backend-trait.workspace = true
+ge-mesh.workspace = true
 glam.workspace = true
 anyhow.workspace = true

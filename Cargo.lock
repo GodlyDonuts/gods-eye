@@ -888,6 +888,8 @@ name = "ge-prim"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "ge-backend-trait",
+ "ge-mesh",
  "glam",
 ]
 

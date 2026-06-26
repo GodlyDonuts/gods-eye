@@ -9,10 +9,14 @@
 //! fitting via geometric moments — and grows detection, persistence, and
 //! polygonization on top.
 
+pub mod detect;
 mod eigen;
 pub mod moments;
+pub mod registry;
 
+pub use detect::{detect_planes, DetectParams, Segment};
 pub use moments::Moments;
+pub use registry::{RegistryParams, WorldPlaneRegistry};
 
 use glam::Vec3;
 
@@ -34,6 +38,25 @@ impl Plane {
     #[inline]
     pub fn project(&self, p: Vec3) -> Vec3 {
         p - self.normal * self.signed_distance(p)
+    }
+
+    /// An orthonormal in-plane basis `(u, v)` perpendicular to `normal`.
+    pub fn basis(&self) -> (Vec3, Vec3) {
+        let a = if self.normal.x.abs() < 0.9 {
+            Vec3::X
+        } else {
+            Vec3::Y
+        };
+        let u = self.normal.cross(a).normalize();
+        let v = self.normal.cross(u).normalize();
+        (u, v)
+    }
+
+    /// World point on the plane for in-plane coordinates `(a, b)` measured along
+    /// `u`/`v` from the world origin (so `a = p·u`, `b = p·v` for `p` on-plane).
+    #[inline]
+    pub fn point_from_uv(&self, a: f32, b: f32, u: Vec3, v: Vec3) -> Vec3 {
+        u * a + v * b + self.normal * self.offset
     }
 }
 

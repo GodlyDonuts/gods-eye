@@ -27,6 +27,16 @@ reconstruct = [
 # 2D panorama: track camera rotation and stitch frames onto a canvas. Isolates
 # the motion-tracking problem from depth/3D.
 panorama = ["window", "camera", "dep:ge-slam"]
+# Low-poly plane reconstruction: depth -> plane detection -> world registry ->
+# oriented-rectangle mesh, posed by 2D-tracking-derived camera rotation.
+planes = [
+    "window",
+    "camera",
+    "dep:ge-depth",
+    "ge-depth/onnx",
+    "dep:ge-prim",
+    "dep:ge-slam",
+]
 
 [dependencies]
 ge-backend-trait.workspace = true
@@ -34,6 +44,7 @@ ge-mesh.workspace = true
 ge-depth = { workspace = true, optional = true }
 ge-fusion = { workspace = true, optional = true }
 ge-slam = { workspace = true, optional = true }
+ge-prim = { workspace = true, optional = true }
 glam.workspace = true
 anyhow.workspace = true
 three-d = { version = "0.19", optional = true }
@@ -55,3 +66,7 @@ required-features = ["reconstruct"]
 [[example]]
 name = "panorama"
 required-features = ["panorama"]
+
+[[example]]
+name = "planes"
+required-features = ["planes"]

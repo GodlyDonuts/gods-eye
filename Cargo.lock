@@ -916,6 +916,7 @@ dependencies = [
  "ge-depth",
  "ge-fusion",
  "ge-mesh",
+ "ge-prim",
  "ge-slam",
  "glam",
  "nokhwa",

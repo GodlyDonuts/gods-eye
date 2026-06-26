@@ -29,6 +29,7 @@ ge-depth = { path = "crates/ge-depth" }
 ge-slam = { path = "crates/ge-slam" }
 ge-fusion = { path = "crates/ge-fusion" }
 ge-mesh = { path = "crates/ge-mesh" }
+ge-prim = { path = "crates/ge-prim" }
 ge-viewer = { path = "crates/ge-viewer" }
 
 [profile.release]

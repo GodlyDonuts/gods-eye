@@ -919,6 +919,7 @@ dependencies = [
  "ge-prim",
  "ge-slam",
  "glam",
+ "image",
  "nokhwa",
  "three-d",
 ]

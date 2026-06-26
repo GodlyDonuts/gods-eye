@@ -51,8 +51,11 @@ impl Default for DetectParams {
             // Loose: grazing planes (floors) legitimately span a depth range
             // within a cell; the 3D flatness test catches real edges/steps.
             jump_ratio: 0.5,
-            normal_cos: 0.965, // ~15°
-            offset_tol: 0.06,
+            // Loose clustering: monocular depth bows flat walls by ~30°, so tight
+            // thresholds shatter one wall into many sub-min_cells fragments. We
+            // fuse the bow into one mean plane; the floor (~75° away) stays apart.
+            normal_cos: 0.82, // ~35°
+            offset_tol: 0.25,
             min_cells: 4,
             min_depth: 0.2,
             max_depth: 6.0,

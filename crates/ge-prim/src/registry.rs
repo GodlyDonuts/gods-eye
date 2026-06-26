@@ -119,7 +119,7 @@ impl WorldPlaneRegistry {
                     plane: world_plane,
                     footprint: world_centroids,
                     observations: 1,
-                    confirmed: false,
+                    confirmed: 1 >= self.params.confirm_after,
                 }),
             }
         }

@@ -37,6 +37,9 @@ planes = [
     "dep:ge-prim",
     "dep:ge-slam",
 ]
+# Offline single-image -> low-poly planes diagnostic (headless: writes PLYs).
+# Our reproducible "basis" for iterating on depth -> plane quality.
+image-recon = ["dep:ge-depth", "ge-depth/onnx", "dep:ge-prim", "dep:image"]
 
 [dependencies]
 ge-backend-trait.workspace = true
@@ -47,6 +50,7 @@ ge-slam = { workspace = true, optional = true }
 ge-prim = { workspace = true, optional = true }
 glam.workspace = true
 anyhow.workspace = true
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }
 three-d = { version = "0.19", optional = true }
 nokhwa = { version = "0.10", features = ["input-native"], optional = true }
 bytemuck = { version = "1", optional = true }
@@ -70,3 +74,7 @@ required-features = ["panorama"]
 [[example]]
 name = "planes"
 required-features = ["planes"]
+
+[[example]]
+name = "image_to_planes"
+required-features = ["image-recon"]

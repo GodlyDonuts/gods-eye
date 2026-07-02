@@ -1,5 +1,90 @@
 # Gods Eye — Roadmap, Risks & Open Questions
 
+## The low-poly plan (2026-07-01) — current milestone ladder
+
+**Pivot:** the world is represented as clean primitives — planes first — with
+dense TSDF meshing demoted to *residual* geometry that planes cannot explain
+(`ge-prim` is the pivot's foundation). The M-series below predates this pivot;
+its stages survive as components (M0 spine = shipped, M1 VO = L2, M2 drift =
+L3, TSDF+mesh = L4) and its risk register still applies, but this ladder
+supersedes its ordering.
+
+**Standing today** (commit 79905a5): live webcam → DAv2 metric depth (CPU,
+252px) → CAPE-style plane detection → moment-fused world plane registry → one
+rectangle per confirmed plane in the live viewer, posed by **rotation-only** 2D
+tracking (pan/tilt/roll; no translation). Offline: point-to-plane ICP core
+(`ge_slam::RgbdVoTracker`) validated in tests, not yet wired live.
+
+### L1 — The room looks architected (stays in the rotation-only regime)
+Planes render as true polygons, not bounding rectangles, and adjacent planes
+meet in crisp edges.
+- Per-plane 2D footprint accumulated in plane-local coordinates (occupancy
+  grid fed by cell centroids) → marching-squares contour → simplified polygon.
+- Plane–plane intersection snapping: where two confirmed planes' footprints
+  approach their mutual intersection line, trim/extend the boundary to that
+  line — walls meet the floor in a sharp edge. Optional Manhattan
+  regularization (snap near-orthogonal/near-parallel normals) behind a param.
+- Footprint hysteresis so polygons grow smoothly instead of popping.
+
+**On screen:** pan around a room → floor, walls, ceiling as crisp polygons
+with sharp corners — an "architected" room from one webcam.
+
+### L2 — Walk around (full 6-DoF pose)
+Wire `RgbdVoTracker` (frame-to-keyframe point-to-plane ICP) into the live
+pipeline, replacing rotation-only tracking.
+- FIRST (M1 discipline): record/replay capture source + offline drift harness —
+  recorded sequences that start and end at the same spot, end-to-end drift
+  reported as a number.
+- Per-keyframe affine (scale+shift) depth alignment before tracking/fusion —
+  the load-bearing mitigation for learned-depth "breathing" (risk #1).
+- Scale-observability gate (freeze scale on rotation-dominant / low-parallax
+  motion); keyframe promotion by overlap fraction.
+
+**On screen:** walk through the room; planes stay put; new walls appear as you
+enter them. Drift is measured, not vibes.
+
+### L3 — It stays put (planes are the landmarks)
+Use the persistent plane registry as the map that corrects the pose —
+plane-SLAM-lite, no sparse-feature machinery.
+- After VO, refine the pose against confirmed world planes (point-to-plane
+  against the registry = a drift brake on every wall, textured or not).
+- Small keyframe pose graph (argmin/nalgebra) with plane-observation edges;
+  loop closure via plane-configuration signatures (normal triads + offsets).
+- Registry re-fuse (moments re-lifted) when the graph updates.
+
+**On screen:** walk a loop around the apartment; on return the walls line up
+instead of double-walling.
+
+### L4 — Everything planes can't explain (residual geometry)
+The adaptive-LOD promise: planes cost 2 triangles; everything else gets a real
+mesh under a hard budget.
+- Residual mask = depth pixels not claimed by confirmed planes → existing
+  `ge-fusion` TSDF (dense CPU grid first, sparse-hash later) → `ge-mesh`
+  surface-nets → QEM decimation to a hard triangle budget.
+- Objects anchor to their supporting plane (sit ON the floor, not near it).
+
+**On screen:** chairs, desks, clutter as compact low-poly meshes standing on
+crisp planes.
+
+### L5 — Beautiful and usable (appearance + robotics API)
+- Plane texturing from the best keyframe per plane (least-oblique, closest)
+  into a simple atlas; stylized flat-shaded palette as the zero-cost fallback.
+- glTF/GLB export of the whole scene (plane polygons + residual meshes).
+- `ge-py` query API: confirmed planes (normal, offset, polygon), floor
+  extraction, a simple occupancy grid for navigation.
+
+**Deliverable:** a textured low-poly room you can open in Blender or hand to a
+motion planner.
+
+### Cross-cutting (cheap, any time, high leverage)
+- CoreML EP spike (open questions 1–2): depth at 392px and/or 2×+ fps headroom.
+- Threaded `ge-core` pipeline (capture/depth/track/fuse stages) once L2 lands —
+  depth running below camera rate must not stall tracking.
+- Keep `image_to_planes` (single image → planes, offline) as the regression
+  fixture for detection quality.
+
+---
+
 ## M0 — Smallest end-to-end loop that puts a LIVE triangle mesh on screen AND builds via `cargo build` on >1 platform (macOS arm64 + Linux x86_64), while empirically measuring base-M1 depth latency so no fps number is committed blind. Deliberately fixed-resolution, identity-or-trivial pose, NO adaptivity, NO loop closure — prove the spine and benchmark depth.
 
 **Effort:** 4-6 weeks for one experienced Rust+GPU engineer. The WGSL marching-cubes + workgroup-scan port and the cross-backend (Metal/Vulkan) validation are the time sinks; the depth spike is days but gates everything; fast-surface-nets-first de-risks the mesh path so M0 can land even if the GPU kernel slips.

@@ -125,9 +125,12 @@ impl WorldPlaneRegistry {
         }
     }
 
-    /// Low-poly mesh: each confirmed plane as one oriented rectangle (2 tris).
+    /// Low-poly mesh: each confirmed plane as its true outline polygon (its real
+    /// shape — an L-shaped floor stays L-shaped), triangulated. Falls back to an
+    /// oriented bounding rectangle when the footprint is too sparse to outline.
     pub fn to_mesh(&self) -> Mesh {
         let mut mesh = Mesh::default();
+        let poly_params = crate::PolyParams::default();
         for wp in self.planes.iter().filter(|p| p.confirmed) {
             if wp.footprint.len() < 3 {
                 continue;
@@ -135,15 +138,26 @@ impl WorldPlaneRegistry {
             let (u, v) = wp.plane.basis();
             // Project footprint to in-plane 2D coords (a = p·u, b = p·v).
             let pts2d: Vec<[f32; 2]> = wp.footprint.iter().map(|p| [p.dot(u), p.dot(v)]).collect();
-            let rect = oriented_rect(&pts2d);
+
+            // Real outline; fall back to the oriented rectangle if too sparse.
+            let poly = crate::footprint_polygon(&pts2d, &poly_params)
+                .unwrap_or_else(|| oriented_rect(&pts2d).to_vec());
+            let tris = crate::triangulate(&poly);
+            if tris.is_empty() {
+                continue;
+            }
+
             let base = mesh.positions.len() as u32;
-            for [a, b] in rect {
+            let n = [wp.plane.normal.x, wp.plane.normal.y, wp.plane.normal.z];
+            for &[a, b] in &poly {
                 let p = wp.plane.point_from_uv(a, b, u, v);
                 mesh.positions.push([p.x, p.y, p.z]);
+                mesh.normals.push(n);
             }
-            // Two triangles, CCW around +normal.
-            mesh.indices
-                .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+            for t in tris {
+                mesh.indices
+                    .extend_from_slice(&[base + t[0], base + t[1], base + t[2]]);
+            }
         }
         mesh
     }

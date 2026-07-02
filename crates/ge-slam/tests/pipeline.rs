@@ -12,6 +12,86 @@ use ge_backend_trait::Intrinsics;
 use ge_prim::{detect_planes, DetectParams, RegistryParams, WorldPlaneRegistry};
 use ge_slam::sim::{default_room, loop_trajectory, render_depth};
 use ge_slam::RgbdVoTracker;
+use glam::Affine3A;
+
+fn test_intr() -> Intrinsics {
+    Intrinsics { fx: 90.0, fy: 90.0, cx: 80.0, cy: 60.0, width: 160, height: 120 }
+}
+
+fn test_det() -> DetectParams {
+    DetectParams {
+        cell: 10,
+        min_cell_points: 40,
+        sigma_k: 0.02,
+        jump_ratio: 0.5,
+        normal_cos: 0.90,
+        offset_tol: 0.15,
+        min_cells: 3,
+        min_depth: 0.2,
+        max_depth: 6.0,
+    }
+}
+
+fn prng(seed: &mut u32) -> f32 {
+    *seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+    (*seed >> 9) as f32 / 8_388_608.0 - 1.0
+}
+
+/// Run the full pipeline over `gt`; when `use_map`, refine each VO pose against
+/// the plane registry (frame-to-map) and feed it back. An optional `glitch`
+/// injects a one-off pose offset at a given frame — a controlled stand-in for a
+/// VO slip/drift jump — so the map's ability to recover can be measured.
+/// Returns (final, max) positional error vs. ground truth (m).
+fn run_pipeline(
+    gt: &[Affine3A],
+    use_map: bool,
+    noise: f32,
+    breathing: f32,
+    glitch: Option<(usize, glam::Vec3)>,
+    mut seed: u32,
+) -> (f32, f32) {
+    let intr = test_intr();
+    let room = default_room();
+    let det = test_det();
+    let mut reg = WorldPlaneRegistry::new(RegistryParams::default());
+    let mut vo = RgbdVoTracker::new(intr);
+    let (mut max_err, mut final_err) = (0.0f32, 0.0f32);
+
+    for (i, pose) in gt.iter().enumerate() {
+        let (scale, shift) = if breathing > 0.0 {
+            (1.0 + breathing * prng(&mut seed), breathing * 0.1 * prng(&mut seed))
+        } else {
+            (1.0, 0.0)
+        };
+        let depth = render_depth(&room, &intr, pose, noise, scale, shift, &mut seed);
+        let mut predicted = vo.track(&depth);
+
+        // Inject a controlled drift jump into the tracker's belief.
+        if let Some((gframe, offset)) = glitch {
+            if i == gframe {
+                let glitched = Affine3A::from_translation(offset) * predicted;
+                vo.set_pose(glitched);
+                predicted = glitched;
+            }
+        }
+
+        let segs = detect_planes(&depth, &intr, &det);
+        let est = if use_map {
+            let corrected = reg.refine_pose(&predicted, &segs).unwrap_or(predicted);
+            vo.set_pose(corrected);
+            corrected
+        } else {
+            predicted
+        };
+        reg.observe(&segs, &est);
+        let e = (est.translation - pose.translation).length();
+        max_err = max_err.max(e);
+        if i == gt.len() - 1 {
+            final_err = e;
+        }
+    }
+    (final_err, max_err)
+}
 
 #[test]
 fn planes_stay_put_while_walking() {
@@ -78,4 +158,36 @@ fn planes_stay_put_while_walking() {
     // Tracking stayed near the true loop (both laps close near the origin).
     let end = vo.world_from_cam().translation.length();
     assert!(end < 0.15, "camera drifted {end:.3} m from the loop start");
+}
+
+#[test]
+fn map_recovers_from_a_drift_glitch() {
+    // The real value of planes-as-landmarks: after the map matures, inject a
+    // 15 cm pose slip (a stand-in for accumulated VO drift / a tracking hiccup).
+    // Frame-to-map registration should pull the pose back onto the map over the
+    // following frames, while VO alone carries the error to the end.
+    let gt = loop_trajectory(180, 0.3);
+    let glitch = Some((90usize, glam::Vec3::new(0.15, 0.0, 0.0)));
+
+    let (vo_final, _) = run_pipeline(&gt, false, 0.004, 0.0, glitch, 5);
+    let (map_final, _) = run_pipeline(&gt, true, 0.004, 0.0, glitch, 5);
+    eprintln!("after glitch — VO-only final={vo_final:.4}  VO+map final={map_final:.4}");
+    assert!(
+        map_final < 0.5 * vo_final,
+        "map should recover most of the 15 cm slip (vo {vo_final:.4}, map {map_final:.4})"
+    );
+}
+
+#[test]
+fn refine_is_a_no_op_when_vo_agrees() {
+    // Do-no-harm: with no glitch and accurate VO, the map correction must not
+    // meaningfully worsen the trajectory (it is a near-no-op via deadband/blend).
+    let gt = loop_trajectory(120, 0.3);
+    let (vo_final, _) = run_pipeline(&gt, false, 0.004, 0.0, None, 5);
+    let (map_final, _) = run_pipeline(&gt, true, 0.004, 0.0, None, 5);
+    eprintln!("no-glitch — VO-only final={vo_final:.4}  VO+map final={map_final:.4}");
+    assert!(
+        map_final < vo_final + 0.02,
+        "refine harmed clean tracking (vo {vo_final:.4}, map {map_final:.4})"
+    );
 }

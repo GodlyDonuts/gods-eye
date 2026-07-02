@@ -92,9 +92,20 @@ fn main() -> anyhow::Result<()> {
 
             // Full 6-DoF depth-assisted VO → camera-to-world pose.
             let tracker = tracker.get_or_insert_with(|| ge_slam::RgbdVoTracker::new(intr));
-            let cam_to_world = tracker.track(&dm);
+            let predicted = tracker.track(&dm);
 
             let segments = ge_prim::detect_planes(&dm, &intr, &det);
+
+            // Frame-to-map plane registration: re-anchor the pose to the
+            // persistent map (drift brake / loop closure), feeding the correction
+            // back to the tracker. A near-no-op while VO agrees with the map.
+            let cam_to_world = match registry.refine_pose(&predicted, &segments) {
+                Some(corrected) => {
+                    tracker.set_pose(corrected);
+                    corrected
+                }
+                None => predicted,
+            };
             registry.observe(&segments, &cam_to_world);
 
             frame_i += 1;

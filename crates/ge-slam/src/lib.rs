@@ -249,6 +249,16 @@ impl RgbdVoTracker {
         self.world_from_cam
     }
 
+    /// Apply an external pose correction (e.g. from frame-to-map plane alignment
+    /// or a pose-graph optimiser). The same world-frame delta is applied to the
+    /// keyframe anchor so the correction persists into subsequent frame-to-keyframe
+    /// tracking instead of being undone on the next frame.
+    pub fn set_pose(&mut self, corrected: Affine3A) {
+        let delta = corrected * self.world_from_cam.inverse();
+        self.world_from_keyframe = delta * self.world_from_keyframe;
+        self.world_from_cam = corrected;
+    }
+
     /// Track a new metric depth frame; returns the updated camera-to-world pose.
     pub fn track(&mut self, depth: &DepthMap) -> Affine3A {
         let cur = build_ref_frame(depth, &self.intr, self.max_depth);

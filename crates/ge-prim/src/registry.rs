@@ -8,7 +8,7 @@
 //! (2 triangles): the low-poly output.
 
 use ge_mesh::Mesh;
-use glam::{Affine3A, Vec3};
+use glam::{Affine3A, Quat, Vec3};
 
 use crate::{Moments, Plane, Segment};
 
@@ -28,6 +28,14 @@ pub struct RegistryParams {
     pub offset_tol: f32,
     pub confirm_after: u32,
     pub max_footprint: usize,
+    /// [`refine_pose`](WorldPlaneRegistry::refine_pose) only aligns to map planes
+    /// with at least this many observations — a mature, stable reference, so a
+    /// freshly-seen plane's rough geometry can't yank the pose.
+    pub refine_min_obs: u32,
+    /// Fraction of the computed map correction actually applied per frame. A
+    /// gentle exponential pull toward the map: ≈0 when VO already agrees (no
+    /// harm), accumulating only against genuine, persistent drift.
+    pub refine_blend: f32,
 }
 
 impl Default for RegistryParams {
@@ -37,6 +45,8 @@ impl Default for RegistryParams {
             offset_tol: 0.12, // loose: monocular offset/scale is fragile
             confirm_after: 3,
             max_footprint: 2000,
+            refine_min_obs: 8,
+            refine_blend: 0.3,
         }
     }
 }
@@ -125,6 +135,159 @@ impl WorldPlaneRegistry {
         }
     }
 
+    /// Refine a predicted camera pose by aligning the current frame's detected
+    /// planes to the confirmed world planes — frame-to-map plane registration.
+    ///
+    /// This is the drift brake: the persistent map is globally consistent, so
+    /// snapping each frame's planes onto it re-anchors the pose every frame and,
+    /// on returning to a mapped area, pulls the camera back onto the existing
+    /// walls instead of laying down doubled ones. Run it *before* [`observe`] and
+    /// feed the result back to the tracker so the map stays self-consistent.
+    ///
+    /// Returns the corrected `cam_to_world`, or `None` when too few or too
+    /// parallel planes match to constrain a correction (VO stays in charge).
+    pub fn refine_pose(&self, predicted: &Affine3A, segments: &[Segment]) -> Option<Affine3A> {
+        // Associate each detected segment (posed by `predicted`) with a confirmed
+        // world plane, by normal (tight) + offset (loose) — as in `observe`.
+        struct Pair {
+            n_p: Vec3, // predicted-plane normal (world)
+            c_p: Vec3, // predicted-plane centroid (world)
+            n_r: Vec3, // matched registry-plane normal (oriented to n_p)
+            d_r: f32,  // matched registry-plane offset (oriented)
+        }
+        let mut pairs: Vec<Pair> = Vec::new();
+        for seg in segments {
+            let wm = seg.moments.transform(predicted);
+            let (Some((wp, _)), Some(c)) = (wm.fit(), wm.centroid()) else {
+                continue;
+            };
+            for rp in self
+                .planes
+                .iter()
+                .filter(|p| p.confirmed && p.observations >= self.params.refine_min_obs)
+            {
+                let dot = wp.normal.dot(rp.plane.normal);
+                if dot.abs() > self.params.normal_cos
+                    && rp.plane.signed_distance(c).abs() < self.params.offset_tol
+                {
+                    // Orient the registry plane into the same hemisphere as wp.
+                    let sign = dot.signum();
+                    pairs.push(Pair {
+                        n_p: wp.normal,
+                        c_p: c,
+                        n_r: rp.plane.normal * sign,
+                        d_r: rp.plane.offset * sign,
+                    });
+                    break;
+                }
+            }
+        }
+        if pairs.len() < 2 {
+            return None;
+        }
+        // Observability: the matched normals must span at least two directions,
+        // else translation is under-constrained (one wall can't fix all axes).
+        let mut s = [0.0f64; 6]; // Σ nᵣnᵣᵀ upper triangle [xx,xy,xz,yy,yz,zz]
+        for p in &pairs {
+            let n = p.n_r;
+            s[0] += (n.x * n.x) as f64;
+            s[1] += (n.x * n.y) as f64;
+            s[2] += (n.x * n.z) as f64;
+            s[3] += (n.y * n.y) as f64;
+            s[4] += (n.y * n.z) as f64;
+            s[5] += (n.z * n.z) as f64;
+        }
+        let (lam_min, _) = crate::eigen::smallest_eigen(s[0], s[1], s[2], s[3], s[4], s[5]);
+        if lam_min < 0.05 {
+            return None; // normals ~parallel: cannot fix in-plane translation
+        }
+
+        // Gauss-Newton for the world-frame correction `delta` (corrected = delta ·
+        // predicted) minimising, per pair, normal misalignment + point-to-plane
+        // offset. Damped for the directions the geometry leaves weak.
+        const W_N: f64 = 1.0; // normal-alignment weight
+        const W_D: f64 = 1.0; // offset weight
+        let mut delta = Affine3A::IDENTITY;
+        for _ in 0..6 {
+            let mut ata = [[0.0f64; 6]; 6];
+            let mut atb = [0.0f64; 6];
+            let mut acc = |j: &[f64; 6], e: f64, w: f64| {
+                for r in 0..6 {
+                    atb[r] += w * j[r] * e;
+                    for c in 0..6 {
+                        ata[r][c] += w * j[r] * j[c];
+                    }
+                }
+            };
+            for p in &pairs {
+                let n_p = (delta.matrix3 * p.n_p).normalize();
+                let c_p = delta.transform_point3(p.c_p);
+                // (a) Normal alignment: want ω×n_p = (n_r − n_p). J_ω = −skew(n_p).
+                let r_n = p.n_r - n_p;
+                let sk = [
+                    [0.0, -n_p.z, n_p.y],
+                    [n_p.z, 0.0, -n_p.x],
+                    [-n_p.y, n_p.x, 0.0],
+                ];
+                for (row, rn) in [r_n.x, r_n.y, r_n.z].into_iter().enumerate() {
+                    let j = [
+                        -sk[row][0] as f64,
+                        -sk[row][1] as f64,
+                        -sk[row][2] as f64,
+                        0.0,
+                        0.0,
+                        0.0,
+                    ];
+                    acc(&j, rn as f64, W_N);
+                }
+                // (b) Offset: want n_r·(ω×c_p + τ) = d_r − n_r·c_p.
+                let r_d = (p.d_r - p.n_r.dot(c_p)) as f64;
+                let jw = c_p.cross(p.n_r);
+                let j = [
+                    jw.x as f64,
+                    jw.y as f64,
+                    jw.z as f64,
+                    p.n_r.x as f64,
+                    p.n_r.y as f64,
+                    p.n_r.z as f64,
+                ];
+                acc(&j, r_d, W_D);
+            }
+            for (k, row) in ata.iter_mut().enumerate() {
+                row[k] += 1e-3;
+            }
+            let Some(x) = solve6(&ata, &atb) else { break };
+            let omega = Vec3::new(x[0] as f32, x[1] as f32, x[2] as f32);
+            let tau = Vec3::new(x[3] as f32, x[4] as f32, x[5] as f32);
+            let step = Affine3A::from_rotation_translation(Quat::from_scaled_axis(omega), tau);
+            delta = step * delta;
+            if omega.length() < 1e-6 && tau.length() < 1e-6 {
+                break;
+            }
+        }
+
+        // Blend: apply only a fraction of the correction so per-frame plane noise
+        // can't jerk the pose, and the map acts as a gentle exponential drift
+        // brake rather than a hard snap.
+        let axis_angle = Quat::from_mat3a(&delta.matrix3).normalize().to_scaled_axis();
+        let blend = self.params.refine_blend;
+        let b_omega = axis_angle * blend;
+        let b_tau = delta.translation * blend;
+
+        // Deadband: VO already agrees with the map → leave it untouched.
+        if b_omega.length() < 1e-4 && b_tau.length() < 1e-4 {
+            return None;
+        }
+        // Reject an implausibly large correction (a bad association) — VO is
+        // trusted over a wild map snap.
+        if Vec3::from(b_tau).length() > 0.2 {
+            return None;
+        }
+        let b_delta =
+            Affine3A::from_rotation_translation(Quat::from_scaled_axis(b_omega), Vec3::from(b_tau));
+        Some(b_delta * *predicted)
+    }
+
     /// Low-poly mesh: each confirmed plane as its true outline polygon (its real
     /// shape — an L-shaped floor stays L-shaped), snapped so adjacent planes meet
     /// in crisp edges, then triangulated. Falls back to an oriented bounding
@@ -209,6 +372,46 @@ impl WorldPlaneRegistry {
         }
         mesh
     }
+}
+
+/// Solve the symmetric positive-definite system `A x = b` (6×6) via Cholesky.
+/// Returns `None` if `A` is not positive-definite (degenerate constraints).
+#[allow(clippy::needless_range_loop)] // triangular index math is clearest as-is
+fn solve6(a: &[[f64; 6]; 6], b: &[f64; 6]) -> Option<[f64; 6]> {
+    let mut l = [[0.0f64; 6]; 6];
+    for i in 0..6 {
+        for j in 0..=i {
+            let mut sum = a[i][j];
+            for k in 0..j {
+                sum -= l[i][k] * l[j][k];
+            }
+            if i == j {
+                if sum <= 1e-12 {
+                    return None;
+                }
+                l[i][j] = sum.sqrt();
+            } else {
+                l[i][j] = sum / l[j][j];
+            }
+        }
+    }
+    let mut y = [0.0f64; 6];
+    for i in 0..6 {
+        let mut s = b[i];
+        for k in 0..i {
+            s -= l[i][k] * y[k];
+        }
+        y[i] = s / l[i][i];
+    }
+    let mut x = [0.0f64; 6];
+    for i in (0..6).rev() {
+        let mut s = y[i];
+        for k in (i + 1)..6 {
+            s -= l[k][i] * x[k];
+        }
+        x[i] = s / l[i][i];
+    }
+    Some(x)
 }
 
 /// Minimum-ish-area oriented rectangle of 2D points via principal axes (PCA):

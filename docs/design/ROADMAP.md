@@ -6,7 +6,7 @@
 dense TSDF meshing demoted to *residual* geometry that planes cannot explain
 (`ge-prim` is the pivot's foundation). The M-series below predates this pivot;
 its stages survive as components (M0 spine = shipped, M1 VO = L2, M2 drift =
-L3, TSDF+mesh = L4) and its risk register still applies, but this ladder
+L3, TSDF+mesh = L5) and its risk register still applies, but this ladder
 supersedes its ordering.
 
 **Standing today** (commit 79905a5): live webcam → DAv2 metric depth (CPU,
@@ -55,7 +55,33 @@ plane-SLAM-lite, no sparse-feature machinery.
 **On screen:** walk a loop around the apartment; on return the walls line up
 instead of double-walling.
 
-### L4 — Everything planes can't explain (residual geometry)
+### L4 — What moves is painted red (and kept out of the map)
+Moving objects — people, pets, roombas — detected **geometrically, by motion,
+not by classification** (stays pure-geometry: no labels, no extra neural net),
+rendered as red blobs in the live view, and masked out of tracking and fusion.
+- Ego-motion-compensated model residual: render the static model's predicted
+  depth (plane registry; later + residual TSDF) from the current pose; live
+  pixels that disagree beyond a depth-adaptive threshold are *unexplained*.
+- Temporal rigidity check: warp the previous keyframe's depth through the
+  relative pose; unexplained pixels that also violate the rigid-static
+  hypothesis frame-over-frame are *moving*. Per-cell dynamicity score with
+  hysteresis separates "moving" from "static but not yet mapped".
+- Cluster moving pixels (image + depth connectivity) → unproject → render as
+  red blobs (viewer gains per-vertex color if it lacks it); nearest-centroid
+  blob tracking for frame-to-frame stability.
+- Feed the mask back: dynamic pixels are excluded from ICP tracking, plane
+  detection, and registry observation. This is the correctness half — and why
+  dynamics lands BEFORE residual fusion (L5): fusing without the mask bakes
+  walking people into the mesh as ghosts.
+- Known limit, documented not hidden: an object that stops moving decays to
+  static after hysteresis and gets mapped (correct — a parked roomba IS
+  furniture); when it moves again its stale geometry must be retired
+  (registry demotion / fusion cleanup).
+
+**On screen:** someone walks through the scene as a red blob; the room behind
+them never bends, and no ghost trail is left in the map.
+
+### L5 — Everything planes can't explain (residual geometry)
 The adaptive-LOD promise: planes cost 2 triangles; everything else gets a real
 mesh under a hard budget.
 - Residual mask = depth pixels not claimed by confirmed planes → existing
@@ -66,7 +92,7 @@ mesh under a hard budget.
 **On screen:** chairs, desks, clutter as compact low-poly meshes standing on
 crisp planes.
 
-### L5 — Beautiful and usable (appearance + robotics API)
+### L6 — Beautiful and usable (appearance + robotics API)
 - Plane texturing from the best keyframe per plane (least-oblique, closest)
   into a simple atlas; stylized flat-shaded palette as the zero-cost fallback.
 - glTF/GLB export of the whole scene (plane polygons + residual meshes).

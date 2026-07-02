@@ -9,14 +9,18 @@ its stages survive as components (M0 spine = shipped, M1 VO = L2, M2 drift =
 L3, TSDF+mesh = L5) and its risk register still applies, but this ladder
 supersedes its ordering.
 
-**Progress:** L1 shipped (2026-07-01) — planes now render as true polygons with
-crisp plane–plane edges. Next up: L2 (walk around / 6-DoF pose).
+**Progress:** L1 + L2 shipped (2026-07-01). L1: planes render as true polygons
+with crisp plane–plane edges. L2: full 6-DoF depth-assisted VO wired live, with
+an offline drift harness (0.2% clean, 1.6% under depth breathing after the
+joint pose+scale mitigation). Next up: L3 (planes as landmarks / drift-free
+return) and L4 (dynamic-object detection, red).
 
-**Standing today** (commit 79905a5): live webcam → DAv2 metric depth (CPU,
-252px) → CAPE-style plane detection → moment-fused world plane registry → one
-rectangle per confirmed plane in the live viewer, posed by **rotation-only** 2D
-tracking (pan/tilt/roll; no translation). Offline: point-to-plane ICP core
-(`ge_slam::RgbdVoTracker`) validated in tests, not yet wired live.
+**Standing today** (post-L2): live webcam → DAv2 metric depth (CPU, 252px) →
+**full 6-DoF depth-assisted VO** (frame-to-keyframe point-to-plane ICP + joint
+per-frame depth-scale alignment) → CAPE-style plane detection → moment-fused
+world plane registry → each confirmed plane as its **true outline polygon** with
+crisp plane–plane edges in the live viewer. The tracker is validated offline
+against ground truth (`ge_slam::sim`); real handheld capture is the next test.
 
 ### L1 — The room looks architected (stays in the rotation-only regime) — SHIPPED
 Planes render as true polygons, not bounding rectangles, and adjacent planes
@@ -40,19 +44,32 @@ with sharp corners — an "architected" room from one webcam. Validated offline:
 `image_to_planes` on a real photo yields clean multi-vertex polygons (7 planes →
 21 tris) with correct per-plane normals and no degenerate geometry.
 
-### L2 — Walk around (full 6-DoF pose)
+### L2 — Walk around (full 6-DoF pose) — SHIPPED
 Wire `RgbdVoTracker` (frame-to-keyframe point-to-plane ICP) into the live
 pipeline, replacing rotation-only tracking.
-- FIRST (M1 discipline): record/replay capture source + offline drift harness —
-  recorded sequences that start and end at the same spot, end-to-end drift
-  reported as a number.
-- Per-keyframe affine (scale+shift) depth alignment before tracking/fusion —
-  the load-bearing mitigation for learned-depth "breathing" (risk #1).
-- Scale-observability gate (freeze scale on rotation-dominant / low-parallax
-  motion); keyframe promotion by overlap fraction.
+- [x] FIRST (M1 discipline): deterministic offline drift harness — a known room
+  + known closed-loop trajectory, tracker run against it, end-to-end drift
+  reported as a number, in CI (`ge-slam/src/sim.rs`). No COLMAP needed; a
+  record/replay real-capture source is a later add for real-data validation.
+- [x] Frame-to-keyframe tracking (was frame-to-frame): **6× lower drift on clean
+  depth** (1.3% → 0.2% of path length over a 1.9 m loop), 4× on noisy.
+- [x] Per-frame depth **scale** alignment, co-estimated jointly with the pose in
+  one 7-DoF solve (risk #1 mitigation): **cuts drift under 5% depth breathing
+  3.1×** (5.0% → 1.6%), and is harmless on clean depth (scale stays ≈1). Shift
+  was dropped deliberately — measured ~98% collinear with scale at room scale,
+  so a joint scale+shift solve is ill-posed.
+- [x] Scale-observability handled by the Tikhonov prior in the joint solve: when
+  scale is degenerate with pose-Z (single frontal wall) the prior keeps scale at
+  1 and lets pose absorb the motion, instead of the two fighting. Keyframe
+  promotion by motion magnitude + inlier-support drop.
+- [ ] Per-keyframe affine applied to the *fused* geometry (vs. just the pose) —
+  lands with L5 residual fusion, where depth consistency matters for the mesh.
+- [ ] Record/replay real-capture source + COLMAP ground-truth on real footage.
 
 **On screen:** walk through the room; planes stay put; new walls appear as you
-enter them. Drift is measured, not vibes.
+enter them. Drift is measured, not vibes: an end-to-end integration test
+(`ge-slam/tests/pipeline.rs`) walks two laps and confirms the floor and front
+wall fuse to their true world positions with the camera home to <15 cm.
 
 ### L3 — It stays put (planes are the landmarks)
 Use the persistent plane registry as the map that corrects the pose —

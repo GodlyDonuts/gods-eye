@@ -9,25 +9,36 @@ its stages survive as components (M0 spine = shipped, M1 VO = L2, M2 drift =
 L3, TSDF+mesh = L5) and its risk register still applies, but this ladder
 supersedes its ordering.
 
+**Progress:** L1 shipped (2026-07-01) — planes now render as true polygons with
+crisp plane–plane edges. Next up: L2 (walk around / 6-DoF pose).
+
 **Standing today** (commit 79905a5): live webcam → DAv2 metric depth (CPU,
 252px) → CAPE-style plane detection → moment-fused world plane registry → one
 rectangle per confirmed plane in the live viewer, posed by **rotation-only** 2D
 tracking (pan/tilt/roll; no translation). Offline: point-to-plane ICP core
 (`ge_slam::RgbdVoTracker`) validated in tests, not yet wired live.
 
-### L1 — The room looks architected (stays in the rotation-only regime)
+### L1 — The room looks architected (stays in the rotation-only regime) — SHIPPED
 Planes render as true polygons, not bounding rectangles, and adjacent planes
 meet in crisp edges.
-- Per-plane 2D footprint accumulated in plane-local coordinates (occupancy
-  grid fed by cell centroids) → marching-squares contour → simplified polygon.
-- Plane–plane intersection snapping: where two confirmed planes' footprints
-  approach their mutual intersection line, trim/extend the boundary to that
-  line — walls meet the floor in a sharp edge. Optional Manhattan
-  regularization (snap near-orthogonal/near-parallel normals) behind a param.
-- Footprint hysteresis so polygons grow smoothly instead of popping.
+- [x] Per-plane 2D footprint rasterized into a plane-local occupancy grid (fed
+  by cell centroids), morphological-close to bridge sparse gaps, hole-fill,
+  largest-component boundary trace → Douglas–Peucker → ear-clip triangulation
+  (`ge-prim/src/polygon.rs::footprint_polygon`/`triangulate`). Concave outlines
+  (L-shaped floors) preserved; oriented-rect fallback for sparse footprints.
+- [x] Plane–plane intersection snapping: each polygon is Sutherland–Hodgman
+  clipped to a neighbour's intersection line, **sliver-guarded** (never removes
+  >35% of area) so a real partition is left intact — walls meet floors on a
+  shared 3D edge (`polygon.rs::snap_to_line`, wired in `registry.rs::to_mesh`).
+- [ ] Footprint hysteresis so polygons grow smoothly instead of popping (defer:
+  do together with L2's per-observation temporal smoothing).
+- [ ] Optional Manhattan regularization (snap near-orthogonal normals) — not yet
+  needed; revisit if walls look skewed on real captures.
 
 **On screen:** pan around a room → floor, walls, ceiling as crisp polygons
-with sharp corners — an "architected" room from one webcam.
+with sharp corners — an "architected" room from one webcam. Validated offline:
+`image_to_planes` on a real photo yields clean multi-vertex polygons (7 planes →
+21 tris) with correct per-plane normals and no degenerate geometry.
 
 ### L2 — Walk around (full 6-DoF pose)
 Wire `RgbdVoTracker` (frame-to-keyframe point-to-plane ICP) into the live

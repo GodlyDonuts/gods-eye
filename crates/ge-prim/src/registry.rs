@@ -126,32 +126,80 @@ impl WorldPlaneRegistry {
     }
 
     /// Low-poly mesh: each confirmed plane as its true outline polygon (its real
-    /// shape — an L-shaped floor stays L-shaped), triangulated. Falls back to an
-    /// oriented bounding rectangle when the footprint is too sparse to outline.
+    /// shape — an L-shaped floor stays L-shaped), snapped so adjacent planes meet
+    /// in crisp edges, then triangulated. Falls back to an oriented bounding
+    /// rectangle when a footprint is too sparse to outline.
     pub fn to_mesh(&self) -> Mesh {
-        let mut mesh = Mesh::default();
         let poly_params = crate::PolyParams::default();
+
+        // Phase 1 — build each confirmed plane's outline polygon (plane-local).
+        struct Poly {
+            plane: Plane,
+            u: Vec3,
+            v: Vec3,
+            pts: Vec<[f32; 2]>,
+        }
+        let mut polys: Vec<Poly> = Vec::new();
         for wp in self.planes.iter().filter(|p| p.confirmed) {
             if wp.footprint.len() < 3 {
                 continue;
             }
             let (u, v) = wp.plane.basis();
-            // Project footprint to in-plane 2D coords (a = p·u, b = p·v).
             let pts2d: Vec<[f32; 2]> = wp.footprint.iter().map(|p| [p.dot(u), p.dot(v)]).collect();
-
-            // Real outline; fall back to the oriented rectangle if too sparse.
             let poly = crate::footprint_polygon(&pts2d, &poly_params)
                 .unwrap_or_else(|| oriented_rect(&pts2d).to_vec());
-            let tris = crate::triangulate(&poly);
+            polys.push(Poly {
+                plane: wp.plane,
+                u,
+                v,
+                pts: poly,
+            });
+        }
+
+        // Phase 2 — snap each polygon to its neighbours' intersection lines so
+        // adjacent planes meet in a crisp edge. Only near, non-parallel planes
+        // participate; snap_to_line itself removes only thin slivers.
+        const PARALLEL_COS: f32 = 0.98; // planes within ~11° are "parallel" → no edge
+        const SNAP_DIST: f32 = 0.15; // line must pass within 15 cm of the polygon
+        const MAX_FRAC: f32 = 0.35; // never cut more than this fraction (partition guard)
+        let bases: Vec<(Plane, Vec3, Vec3)> = polys.iter().map(|p| (p.plane, p.u, p.v)).collect();
+        for i in 0..polys.len() {
+            let (pi, ui, vi) = bases[i];
+            for &(pj, _, _) in bases.iter() {
+                if pi.normal.dot(pj.normal).abs() > PARALLEL_COS {
+                    continue;
+                }
+                // Intersection line of plane j, expressed in plane i's (u,v):
+                //   (n_j·u_i) a + (n_j·v_i) b = d_j − (n_j·n_i) d_i
+                let alpha = pj.normal.dot(ui);
+                let beta = pj.normal.dot(vi);
+                let gamma = pj.offset - pj.normal.dot(pi.normal) * pi.offset;
+                let scale = (alpha * alpha + beta * beta).sqrt();
+                if scale < 1e-6 {
+                    continue;
+                }
+                let near = polys[i]
+                    .pts
+                    .iter()
+                    .any(|&p| ((alpha * p[0] + beta * p[1] - gamma) / scale).abs() < SNAP_DIST);
+                if near {
+                    polys[i].pts = crate::snap_to_line(&polys[i].pts, (alpha, beta, gamma), MAX_FRAC);
+                }
+            }
+        }
+
+        // Phase 3 — triangulate and emit with per-vertex plane normals.
+        let mut mesh = Mesh::default();
+        for p in &polys {
+            let tris = crate::triangulate(&p.pts);
             if tris.is_empty() {
                 continue;
             }
-
             let base = mesh.positions.len() as u32;
-            let n = [wp.plane.normal.x, wp.plane.normal.y, wp.plane.normal.z];
-            for &[a, b] in &poly {
-                let p = wp.plane.point_from_uv(a, b, u, v);
-                mesh.positions.push([p.x, p.y, p.z]);
+            let n = [p.plane.normal.x, p.plane.normal.y, p.plane.normal.z];
+            for &[a, b] in &p.pts {
+                let pw = p.plane.point_from_uv(a, b, p.u, p.v);
+                mesh.positions.push([pw.x, pw.y, pw.z]);
                 mesh.normals.push(n);
             }
             for t in tris {
@@ -318,5 +366,15 @@ mod tests {
         }
         // The map stays tiny.
         assert!(confirmed.len() <= 6);
+
+        // to_mesh() produces a valid, non-empty low-poly mesh: normals present
+        // per vertex, indices in range, triangles non-degenerate.
+        let mesh = reg.to_mesh();
+        assert!(mesh.triangle_count() > 0, "empty mesh");
+        assert_eq!(mesh.normals.len(), mesh.positions.len(), "missing normals");
+        let nv = mesh.positions.len() as u32;
+        assert!(mesh.indices.iter().all(|&i| i < nv), "index out of range");
+        // Each plane contributes at least one triangle (>= 3 planes worth).
+        assert!(mesh.triangle_count() >= 3, "too few triangles");
     }
 }

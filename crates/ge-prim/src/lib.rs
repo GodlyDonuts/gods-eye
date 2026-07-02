@@ -17,7 +17,7 @@ pub mod registry;
 
 pub use detect::{detect_planes, DetectParams, Segment};
 pub use moments::Moments;
-pub use polygon::{footprint_polygon, triangulate, PolyParams};
+pub use polygon::{footprint_polygon, snap_to_line, triangulate, PolyParams};
 pub use registry::{RegistryParams, WorldPlaneRegistry};
 
 use glam::Vec3;

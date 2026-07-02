@@ -181,6 +181,77 @@ pub fn triangulate(poly: &[[f32; 2]]) -> Vec<[u32; 3]> {
     tris
 }
 
+/// Snap a plane-local polygon to a plane–plane intersection line so two planes
+/// meet in a crisp edge. `line = (α, β, γ)` defines `f(a,b) = α·a + β·b − γ`;
+/// the polygon is clipped to the half-plane containing its own centroid (the
+/// bulk of the surface), removing the sliver that pokes across the line.
+///
+/// Guarded: the clip is applied **only** if it removes at most `max_frac` of the
+/// area — a thin overshoot — so a real partition that genuinely divides the
+/// surface (a large fraction on the far side) is left intact. Returns the
+/// clipped polygon, or the original when the guard trips or the geometry is
+/// degenerate.
+pub fn snap_to_line(poly: &[[f32; 2]], line: (f32, f32, f32), max_frac: f32) -> Vec<[f32; 2]> {
+    let (alpha, beta, gamma) = line;
+    let scale = (alpha * alpha + beta * beta).sqrt();
+    if poly.len() < 3 || scale < 1e-6 {
+        return poly.to_vec();
+    }
+    let f = |p: [f32; 2]| (alpha * p[0] + beta * p[1] - gamma) / scale;
+
+    // Centroid side decides which half to keep; ambiguous if centroid is on the
+    // line (surface centered on it) — then don't cut.
+    let c = centroid(poly);
+    let cs = f(c);
+    if cs.abs() < 1e-4 {
+        return poly.to_vec();
+    }
+    let keep_positive = cs > 0.0;
+    let inside = |p: [f32; 2]| (f(p) > 0.0) == keep_positive;
+
+    // Sutherland–Hodgman against the single half-plane.
+    let n = poly.len();
+    let mut out: Vec<[f32; 2]> = Vec::with_capacity(n + 4);
+    for i in 0..n {
+        let cur = poly[i];
+        let prev = poly[(i + n - 1) % n];
+        let (ci, pi) = (inside(cur), inside(prev));
+        if ci {
+            if !pi {
+                out.push(intersect(prev, cur, &f));
+            }
+            out.push(cur);
+        } else if pi {
+            out.push(intersect(prev, cur, &f));
+        }
+    }
+    if out.len() < 3 {
+        return poly.to_vec();
+    }
+
+    let (a_full, a_clip) = (signed_area(poly).abs(), signed_area(&out).abs());
+    if a_full <= 0.0 || (a_full - a_clip) / a_full > max_frac {
+        return poly.to_vec(); // too much removed → a real partition, not a sliver
+    }
+    out
+}
+
+fn centroid(poly: &[[f32; 2]]) -> [f32; 2] {
+    let n = poly.len() as f32;
+    let (mut cx, mut cy) = (0.0, 0.0);
+    for p in poly {
+        cx += p[0];
+        cy += p[1];
+    }
+    [cx / n, cy / n]
+}
+
+fn intersect(p: [f32; 2], q: [f32; 2], f: &impl Fn([f32; 2]) -> f32) -> [f32; 2] {
+    let (fp, fq) = (f(p), f(q));
+    let t = fp / (fp - fq); // fp, fq have opposite signs here
+    [p[0] + t * (q[0] - p[0]), p[1] + t * (q[1] - p[1])]
+}
+
 // ---- occupancy-grid helpers -------------------------------------------------
 
 fn dilate(occ: &[bool], w: usize, h: usize) -> Vec<bool> {
@@ -551,6 +622,35 @@ mod tests {
             })
             .sum();
         assert!((tri_area - area).abs() < 0.1, "tri area {tri_area} vs poly {area}");
+    }
+
+    #[test]
+    fn snap_trims_a_sliver_to_the_line() {
+        // Unit square; line a = 0.9. Centroid at a=0.5 → keep a<0.9, drop the
+        // 10% strip. Result terminates on the line.
+        let sq = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        let out = snap_to_line(&sq, (1.0, 0.0, 0.9), 0.35);
+        let max_a = out.iter().fold(f32::MIN, |m, p| m.max(p[0]));
+        assert!(max_a <= 0.9 + 1e-4, "not clipped to line: max_a={max_a}");
+        assert!((signed_area(&out).abs() - 0.9).abs() < 0.02, "area off");
+    }
+
+    #[test]
+    fn snap_preserves_a_real_partition() {
+        // Line through the middle (a = 0.5) would remove ~half → a genuine
+        // partition, not a sliver. Guard must leave the polygon untouched.
+        let sq = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        let out = snap_to_line(&sq, (1.0, 0.0, 0.5), 0.35);
+        assert_eq!(out.len(), sq.len());
+        assert!((signed_area(&out).abs() - 1.0).abs() < 1e-4, "should be unchanged");
+    }
+
+    #[test]
+    fn snap_ignores_a_far_line() {
+        // Line well outside the polygon removes nothing → returned as-is.
+        let sq = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        let out = snap_to_line(&sq, (1.0, 0.0, 5.0), 0.35);
+        assert!((signed_area(&out).abs() - 1.0).abs() < 1e-4);
     }
 
     #[test]

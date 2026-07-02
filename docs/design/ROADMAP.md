@@ -9,11 +9,13 @@ its stages survive as components (M0 spine = shipped, M1 VO = L2, M2 drift =
 L3, TSDF+mesh = L5) and its risk register still applies, but this ladder
 supersedes its ordering.
 
-**Progress:** L1 + L2 shipped (2026-07-01). L1: planes render as true polygons
-with crisp plane–plane edges. L2: full 6-DoF depth-assisted VO wired live, with
-an offline drift harness (0.2% clean, 1.6% under depth breathing after the
-joint pose+scale mitigation). Next up: L3 (planes as landmarks / drift-free
-return) and L4 (dynamic-object detection, red).
+**Progress:** L1, L2, L3-core shipped (2026-07-01). L1: planes render as true
+polygons with crisp plane–plane edges. L2: full 6-DoF depth-assisted VO wired
+live, offline drift harness (0.2% clean, 1.6% under depth breathing after the
+joint pose+scale mitigation). L3-core: frame-to-map plane registration as a
+drift brake (recovers 4.9× from a 15 cm slip; explicit pose-graph loop closure
+deferred until real-data drift can demonstrate its value). Next up: L4
+(dynamic-object detection, red) — user-requested.
 
 **Standing today** (post-L2): live webcam → DAv2 metric depth (CPU, 252px) →
 **full 6-DoF depth-assisted VO** (frame-to-keyframe point-to-plane ICP + joint
@@ -71,17 +73,34 @@ enter them. Drift is measured, not vibes: an end-to-end integration test
 (`ge-slam/tests/pipeline.rs`) walks two laps and confirms the floor and front
 wall fuse to their true world positions with the camera home to <15 cm.
 
-### L3 — It stays put (planes are the landmarks)
+### L3 — It stays put (planes are the landmarks) — CORE SHIPPED
 Use the persistent plane registry as the map that corrects the pose —
 plane-SLAM-lite, no sparse-feature machinery.
-- After VO, refine the pose against confirmed world planes (point-to-plane
-  against the registry = a drift brake on every wall, textured or not).
-- Small keyframe pose graph (argmin/nalgebra) with plane-observation edges;
-  loop closure via plane-configuration signatures (normal triads + offsets).
-- Registry re-fuse (moments re-lifted) when the graph updates.
+- [x] Frame-to-map plane registration (`registry.rs::refine_pose`): each frame's
+  detected planes are aligned to the confirmed world planes (normal + offset
+  Gauss-Newton over matched plane pairs), and the correction is fed back to the
+  tracker (`ge_slam::RgbdVoTracker::set_pose`). Wired live before `observe` so
+  the map stays self-consistent.
+- [x] Made **provably conservative**: maturity gate (only align to planes with
+  ≥8 observations), gentle blend (30% per frame — an exponential pull, not a
+  hard snap), deadband + clamp. **Recovers 4.9× from an injected 15 cm pose
+  slip** while being a near-no-op when VO already agrees with the map
+  (`ge-slam/tests/pipeline.rs`).
+- **Key finding (honest):** on the synthetic harness the VO is already so
+  accurate (0.2% clean) that naive frame-to-map correction *hurt* — it attributes
+  per-frame depth noise to pose error and injects the map's own residual. So the
+  brake is validated for what it genuinely does — **recover from real drift /
+  slips** — not for beating an already-near-perfect pose. Its everyday value
+  shows up on real handheld capture, where VO drift is larger.
+- [ ] Explicit keyframe pose graph + plane-signature loop closure — **deferred**:
+  frame-to-map already delivers the re-anchoring; a pose graph's incremental
+  value can't be demonstrated until we have a real-data (or exploration-then-
+  return) scenario with substantial recoverable drift. Revisit with real capture.
+- [ ] Registry re-fuse / near-duplicate plane merge when the graph updates —
+  deferred with the pose graph.
 
-**On screen:** walk a loop around the apartment; on return the walls line up
-instead of double-walling.
+**On screen:** walk a loop; if the pose slips, returning to mapped walls pulls
+it back onto them instead of laying down a second, offset wall.
 
 ### L4 — What moves is painted red (and kept out of the map)
 Moving objects — people, pets, roombas — detected **geometrically, by motion,

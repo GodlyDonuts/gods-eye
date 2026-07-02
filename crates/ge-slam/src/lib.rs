@@ -12,6 +12,8 @@
 use ge_backend_trait::{DepthMap, Frame, Intrinsics, Pose, PoseEstimator};
 use glam::{Affine2, Affine3A, Quat, Vec2, Vec3};
 
+pub mod sim;
+
 /// A trivial pose estimator that always reports the identity (camera fixed at
 /// the origin). Lets fusion run on a static scene.
 pub struct IdentityPose;

@@ -24,11 +24,11 @@ impl PoseEstimator for IdentityPose {
     }
 }
 
-/// Solve the symmetric positive-definite system `A x = b` (6×6) via Cholesky.
+/// Solve the symmetric positive-definite system `A x = b` (`N×N`) via Cholesky.
 /// Returns `None` if `A` is not positive-definite (degenerate constraints).
-fn solve6(a: &[[f64; 6]; 6], b: &[f64; 6]) -> Option<[f64; 6]> {
-    let mut l = [[0.0f64; 6]; 6];
-    for i in 0..6 {
+fn solve_spd<const N: usize>(a: &[[f64; N]; N], b: &[f64; N]) -> Option<[f64; N]> {
+    let mut l = [[0.0f64; N]; N];
+    for i in 0..N {
         for j in 0..=i {
             let mut sum = a[i][j];
             for k in 0..j {
@@ -45,8 +45,8 @@ fn solve6(a: &[[f64; 6]; 6], b: &[f64; 6]) -> Option<[f64; 6]> {
         }
     }
     // Forward solve L y = b.
-    let mut y = [0.0f64; 6];
-    for i in 0..6 {
+    let mut y = [0.0f64; N];
+    for i in 0..N {
         let mut s = b[i];
         for k in 0..i {
             s -= l[i][k] * y[k];
@@ -54,10 +54,10 @@ fn solve6(a: &[[f64; 6]; 6], b: &[f64; 6]) -> Option<[f64; 6]> {
         y[i] = s / l[i][i];
     }
     // Back solve Lᵀ x = y.
-    let mut x = [0.0f64; 6];
-    for i in (0..6).rev() {
+    let mut x = [0.0f64; N];
+    for i in (0..N).rev() {
         let mut s = y[i];
-        for k in (i + 1)..6 {
+        for k in (i + 1)..N {
             s -= l[k][i] * x[k];
         }
         x[i] = s / l[i][i];
@@ -104,7 +104,7 @@ pub fn align_point_to_plane(
         for k in 0..6 {
             ata[k][k] += 1e-9;
         }
-        let Some(x) = solve6(&ata, &atb) else { break };
+        let Some(x) = solve_spd(&ata, &atb) else { break };
         let omega = Vec3::new(x[0] as f32, x[1] as f32, x[2] as f32);
         let trans = Vec3::new(x[3] as f32, x[4] as f32, x[5] as f32);
         let step = Affine3A::from_rotation_translation(Quat::from_scaled_axis(omega), trans);
@@ -114,6 +114,16 @@ pub fn align_point_to_plane(
         }
     }
     t
+}
+
+/// Result of one frame-to-keyframe alignment.
+struct RelResult {
+    /// `keyframe_from_cur` rigid pose.
+    pose: Affine3A,
+    /// Final point-to-plane inlier count.
+    inliers: usize,
+    /// Co-estimated per-frame depth scale for this frame.
+    scale: f32,
 }
 
 /// An organized (per-pixel) point + normal frame in camera coordinates, used as
@@ -198,6 +208,20 @@ pub struct RgbdVoTracker {
     pub keyframe_max_rot: f32,
     /// … or inlier support falls below this.
     pub min_inliers: usize,
+    /// Co-estimate a per-frame depth **scale** `d' = a·d` jointly with the pose
+    /// to absorb learned-depth "breathing" before it biases the estimate (risk #1
+    /// mitigation). Shift is deliberately not estimated: over a room-scale depth
+    /// range scale and shift are ~98% collinear (measured), so a joint solve for
+    /// both is ill-posed; scale is the dominant, well-posed correction.
+    pub estimate_scale: bool,
+    /// Tikhonov prior pulling the depth scale toward 1 (added to the scale
+    /// diagonal of the joint normal matrix). Large enough that scale only moves
+    /// when the data clearly demands it — and, crucially, so that when scale is
+    /// degenerate with pose-Z (a single frontal wall) the prior keeps scale at 1
+    /// and lets pose absorb the motion, instead of the two fighting.
+    pub scale_prior: f64,
+    /// Last co-estimated per-frame depth scale — diagnostics.
+    pub last_scale: f32,
 }
 
 impl RgbdVoTracker {
@@ -215,6 +239,9 @@ impl RgbdVoTracker {
             keyframe_max_trans: 0.15,
             keyframe_max_rot: 8.0_f32.to_radians(),
             min_inliers: 400,
+            estimate_scale: true,
+            scale_prior: 150.0,
+            last_scale: 1.0,
         }
     }
 
@@ -230,10 +257,12 @@ impl RgbdVoTracker {
             self.world_from_keyframe = self.world_from_cam;
             return self.world_from_cam;
         }
-        let (rel, inliers) = self.estimate_relative(&cur);
+        let rel_result = self.estimate_relative(&cur);
+        let (rel, inliers) = (rel_result.pose, rel_result.inliers);
         // world_from_cur = world_from_keyframe * keyframe_from_cur
         self.world_from_cam = self.world_from_keyframe * rel;
         self.last_rel = rel;
+        self.last_scale = rel_result.scale;
 
         // Promote a new keyframe when we've moved far from the current one or
         // lost support — bounding both motion magnitude and overlap loss.
@@ -253,17 +282,22 @@ impl RgbdVoTracker {
     }
 
     /// Estimate `keyframe_from_cur` aligning the current frame onto the keyframe
-    /// (projective association + point-to-plane Gauss-Newton). Returns the pose
-    /// and the final inlier count. Warm-started from the last estimate.
-    fn estimate_relative(&self, cur: &RefFrame) -> (Affine3A, usize) {
+    /// (projective association + point-to-plane Gauss-Newton), jointly solving for
+    /// a per-frame depth **scale** `d' = a·d`. Pose (6) + scale (1) share one 7×7
+    /// system so their coupling (scale vs. pose-Z) is resolved in one solve, with
+    /// a Tikhonov prior keeping scale at 1 unless the data clearly moves it.
+    /// Warm-started from the last pose estimate; scale restarts at 1 each frame.
+    fn estimate_relative(&self, cur: &RefFrame) -> RelResult {
         let prev = self.keyframe.as_ref().unwrap();
         let (fx, fy, cx, cy) = (self.intr.fx, self.intr.fy, self.intr.cx, self.intr.cy);
         let (pw, ph) = (prev.width, prev.height);
+        let n_dof = if self.estimate_scale { 7 } else { 6 };
         let mut t = self.last_rel;
+        let mut a = 1.0f32; // per-frame depth scale: d' = a·d
         let mut last_count = 0usize;
         for _ in 0..self.max_iters {
-            let mut ata = [[0.0f64; 6]; 6];
-            let mut atb = [0.0f64; 6];
+            let mut ata = [[0.0f64; 7]; 7];
+            let mut atb = [0.0f64; 7];
             let mut count = 0usize;
             let mut v = 0;
             while v < cur.height {
@@ -271,7 +305,9 @@ impl RgbdVoTracker {
                 while u < cur.width {
                     let si = v * cur.width + u;
                     if cur.valid[si] {
-                        let s = t.transform_point3(cur.points[si]);
+                        let p = cur.points[si];
+                        let pc = p * a; // scale-corrected source point
+                        let s = t.transform_point3(pc);
                         if s.z > 0.05 {
                             let pu = (fx * s.x / s.z + cx).round();
                             let pv = (fy * s.y / s.z + cy).round();
@@ -282,13 +318,16 @@ impl RgbdVoTracker {
                                     if (s - q).length() < self.dist_thresh {
                                         let e = (s - q).dot(n) as f64;
                                         let c = s.cross(n);
+                                        // Jacobian: pose [ω, t] plus scale
+                                        // ∂e/∂a = (R·p)·n (R = t's rotation).
+                                        let js = t.transform_vector3(p).dot(n) as f64;
                                         let j = [
                                             c.x as f64, c.y as f64, c.z as f64, n.x as f64,
-                                            n.y as f64, n.z as f64,
+                                            n.y as f64, n.z as f64, js,
                                         ];
-                                        for r in 0..6 {
+                                        for r in 0..n_dof {
                                             atb[r] -= j[r] * e;
-                                            for col in 0..6 {
+                                            for col in 0..n_dof {
                                                 ata[r][col] += j[r] * j[col];
                                             }
                                         }
@@ -309,16 +348,42 @@ impl RgbdVoTracker {
             for k in 0..6 {
                 ata[k][k] += 1e-6;
             }
-            let Some(x) = solve6(&ata, &atb) else { break };
-            let omega = Vec3::new(x[0] as f32, x[1] as f32, x[2] as f32);
-            let trans = Vec3::new(x[3] as f32, x[4] as f32, x[5] as f32);
+            // Scale prior: Tikhonov pull toward a = 1 on the 7th parameter.
+            let (omega, trans, da) = if self.estimate_scale {
+                ata[6][6] += self.scale_prior;
+                atb[6] -= self.scale_prior * (a as f64 - 1.0);
+                let Some(x) = solve_spd::<7>(&ata, &atb) else { break };
+                (
+                    Vec3::new(x[0] as f32, x[1] as f32, x[2] as f32),
+                    Vec3::new(x[3] as f32, x[4] as f32, x[5] as f32),
+                    x[6] as f32,
+                )
+            } else {
+                let mut a6 = [[0.0f64; 6]; 6];
+                let mut b6 = [0.0f64; 6];
+                for r in 0..6 {
+                    b6[r] = atb[r];
+                    a6[r][..6].copy_from_slice(&ata[r][..6]);
+                }
+                let Some(x) = solve_spd::<6>(&a6, &b6) else { break };
+                (
+                    Vec3::new(x[0] as f32, x[1] as f32, x[2] as f32),
+                    Vec3::new(x[3] as f32, x[4] as f32, x[5] as f32),
+                    0.0,
+                )
+            };
             let step = Affine3A::from_rotation_translation(Quat::from_scaled_axis(omega), trans);
             t = step * t;
-            if omega.length() < 1e-6 && trans.length() < 1e-6 {
+            a = (a + da).clamp(0.8, 1.25);
+            if omega.length() < 1e-6 && trans.length() < 1e-6 && da.abs() < 1e-6 {
                 break;
             }
         }
-        (t, last_count)
+        RelResult {
+            pose: t,
+            inliers: last_count,
+            scale: a,
+        }
     }
 }
 

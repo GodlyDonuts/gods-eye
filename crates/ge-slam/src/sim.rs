@@ -145,10 +145,12 @@ fn rot_angle(a: &Affine3A, b: &Affine3A) -> f32 {
     qa.angle_between(qb)
 }
 
-/// Run the tracker over depth rendered along ground-truth poses `gt` and compare
-/// the estimated trajectory against it. `gt[0]` should be the identity (the
-/// tracker starts there). See [`render_depth`] for the noise/breathing params.
+/// Run `vo` over depth rendered along ground-truth poses `gt` and compare the
+/// estimated trajectory against it. `gt[0]` should be the identity (the tracker
+/// starts there). Taking the tracker by value lets callers configure it (e.g.
+/// toggle `estimate_scale`). See [`render_depth`] for the noise/breathing params.
 pub fn run_drift(
+    mut vo: RgbdVoTracker,
     gt: &[Affine3A],
     planes: &[SimPlane],
     intr: &Intrinsics,
@@ -156,7 +158,6 @@ pub fn run_drift(
     breathing: f32,
     mut seed: u32,
 ) -> DriftReport {
-    let mut vo = RgbdVoTracker::new(*intr);
     let mut max_pos_err = 0.0f32;
     let mut max_rot_err = 0.0f32;
     let mut final_pos_err = 0.0f32;
@@ -216,7 +217,7 @@ mod tests {
     #[test]
     fn perfect_depth_tracks_the_loop() {
         let gt = loop_trajectory(60, 0.3);
-        let report = run_drift(&gt, &default_room(), &intr(), 0.0, 0.0, 1);
+        let report = run_drift(RgbdVoTracker::new(intr()), &gt, &default_room(), &intr(), 0.0, 0.0, 1);
         eprintln!("perfect: {report:?}");
         // Frame-to-keyframe on perfect depth follows the loop very closely
         // (measured ~0.2%); the bound leaves headroom but catches regressions.
@@ -233,24 +234,44 @@ mod tests {
     #[test]
     fn noisy_depth_stays_bounded() {
         let gt = loop_trajectory(60, 0.3);
-        let report = run_drift(&gt, &default_room(), &intr(), 0.01, 0.0, 7);
+        let report = run_drift(RgbdVoTracker::new(intr()), &gt, &default_room(), &intr(), 0.01, 0.0, 7);
         eprintln!("noisy: {report:?}");
         assert!(report.drift_ratio < 0.05, "drift ratio {:.3}", report.drift_ratio);
     }
 
     #[test]
-    fn breathing_is_worse_than_perfect() {
-        // Documents risk #1: per-frame depth breathing degrades tracking. The
-        // affine-alignment mitigation (L2b) should later shrink this gap.
+    fn scale_estimation_shrinks_breathing_drift() {
+        // Risk #1, quantified and mitigated: under per-frame depth breathing,
+        // the joint pose+scale solve should markedly beat the pose-only tracker,
+        // while on clean depth it must do no harm (scale stays ~1).
         let gt = loop_trajectory(60, 0.3);
-        let clean = run_drift(&gt, &default_room(), &intr(), 0.0, 0.0, 3);
-        let breathing = run_drift(&gt, &default_room(), &intr(), 0.0, 0.05, 3);
-        eprintln!("clean {:?}\nbreathing {:?}", clean, breathing);
+        let room = default_room();
+
+        let with_scale = RgbdVoTracker::new(intr());
+        let mut without_scale = RgbdVoTracker::new(intr());
+        without_scale.estimate_scale = false;
+
+        let mitigated = run_drift(with_scale, &gt, &room, &intr(), 0.0, 0.05, 3);
+        let baseline = run_drift(without_scale, &gt, &room, &intr(), 0.0, 0.05, 3);
+        eprintln!("breathing baseline {baseline:?}\nmitigated {mitigated:?}");
         assert!(
-            breathing.final_pos_err >= clean.final_pos_err,
-            "breathing ({:.3}) should not beat clean ({:.3})",
-            breathing.final_pos_err,
-            clean.final_pos_err
+            mitigated.final_pos_err < 0.6 * baseline.final_pos_err,
+            "scale estimation should cut breathing drift by >40% (baseline {:.3}, mitigated {:.3})",
+            baseline.final_pos_err,
+            mitigated.final_pos_err
+        );
+
+        // Do-no-harm on clean depth: with-scale ≈ without-scale.
+        let clean_on = run_drift(RgbdVoTracker::new(intr()), &gt, &room, &intr(), 0.0, 0.0, 3);
+        let mut off = RgbdVoTracker::new(intr());
+        off.estimate_scale = false;
+        let clean_off = run_drift(off, &gt, &room, &intr(), 0.0, 0.0, 3);
+        assert!(
+            clean_on.final_pos_err < clean_off.final_pos_err + 0.01,
+            "scale estimation harmed clean tracking ({:.4} vs {:.4})",
+            clean_on.final_pos_err,
+            clean_off.final_pos_err
         );
     }
 }
+

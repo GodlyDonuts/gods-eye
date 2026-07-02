@@ -218,15 +218,16 @@ mod tests {
         let gt = loop_trajectory(60, 0.3);
         let report = run_drift(&gt, &default_room(), &intr(), 0.0, 0.0, 1);
         eprintln!("perfect: {report:?}");
-        // With perfect depth the tracker should follow the loop closely.
+        // Frame-to-keyframe on perfect depth follows the loop very closely
+        // (measured ~0.2%); the bound leaves headroom but catches regressions.
         assert!(
-            report.drift_ratio < 0.10,
+            report.drift_ratio < 0.02,
             "drift ratio {:.3} too high (final {:.3} m over {:.3} m)",
             report.drift_ratio,
             report.final_pos_err,
             report.path_length
         );
-        assert!(report.max_rot_err_deg < 5.0, "rot err {:.2}°", report.max_rot_err_deg);
+        assert!(report.max_rot_err_deg < 1.0, "rot err {:.2}°", report.max_rot_err_deg);
     }
 
     #[test]
@@ -234,7 +235,7 @@ mod tests {
         let gt = loop_trajectory(60, 0.3);
         let report = run_drift(&gt, &default_room(), &intr(), 0.01, 0.0, 7);
         eprintln!("noisy: {report:?}");
-        assert!(report.drift_ratio < 0.25, "drift ratio {:.3}", report.drift_ratio);
+        assert!(report.drift_ratio < 0.05, "drift ratio {:.3}", report.drift_ratio);
     }
 
     #[test]

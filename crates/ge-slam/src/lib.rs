@@ -170,21 +170,34 @@ fn build_ref_frame(depth: &DepthMap, intr: &Intrinsics, max_depth: f32) -> RefFr
     }
 }
 
-/// Frame-to-frame depth-assisted visual odometry via projective point-to-plane
+/// Frame-to-keyframe depth-assisted visual odometry via projective point-to-plane
 /// ICP, accumulating a metric camera-to-world pose.
 ///
-/// This is dead-reckoning (no keyframes or loop closure yet), so it drifts over
-/// long sessions — good for "recent" backtracking; global consistency comes with
-/// the pose-graph milestone.
+/// Each incoming frame is aligned to the current **keyframe** rather than the
+/// immediately previous frame, so error accumulates once per keyframe span
+/// instead of once per frame. A new keyframe is promoted when the motion from
+/// the current one grows past a threshold or the inlier support drops. Still
+/// dead-reckoning between keyframes (no loop closure yet) — global consistency
+/// comes with the pose-graph milestone (L3).
 pub struct RgbdVoTracker {
     intr: Intrinsics,
     world_from_cam: Affine3A,
-    prev: Option<RefFrame>,
+    /// Reference frame all incoming frames are aligned against.
+    keyframe: Option<RefFrame>,
+    /// World pose of the current keyframe.
+    world_from_keyframe: Affine3A,
+    /// Last `keyframe_from_cur` estimate, used to warm-start the next solve.
+    last_rel: Affine3A,
     /// Pixel stride for ICP source sampling (speed vs. accuracy).
     pub stride: usize,
     pub max_iters: usize,
     pub max_depth: f32,
     pub dist_thresh: f32,
+    /// Promote a new keyframe once motion from the current one exceeds these …
+    pub keyframe_max_trans: f32,
+    pub keyframe_max_rot: f32,
+    /// … or inlier support falls below this.
+    pub min_inliers: usize,
 }
 
 impl RgbdVoTracker {
@@ -192,11 +205,16 @@ impl RgbdVoTracker {
         Self {
             intr,
             world_from_cam: Affine3A::IDENTITY,
-            prev: None,
+            keyframe: None,
+            world_from_keyframe: Affine3A::IDENTITY,
+            last_rel: Affine3A::IDENTITY,
             stride: 4,
             max_iters: 12,
             max_depth: 5.0,
             dist_thresh: 0.2,
+            keyframe_max_trans: 0.15,
+            keyframe_max_rot: 8.0_f32.to_radians(),
+            min_inliers: 400,
         }
     }
 
@@ -207,24 +225,42 @@ impl RgbdVoTracker {
     /// Track a new metric depth frame; returns the updated camera-to-world pose.
     pub fn track(&mut self, depth: &DepthMap) -> Affine3A {
         let cur = build_ref_frame(depth, &self.intr, self.max_depth);
-        if self.prev.is_none() {
-            self.prev = Some(cur);
+        if self.keyframe.is_none() {
+            self.keyframe = Some(cur);
+            self.world_from_keyframe = self.world_from_cam;
             return self.world_from_cam;
         }
-        let rel = self.estimate_relative(&cur);
-        // world_from_cur = world_from_prev * prev_from_cur
-        self.world_from_cam *= rel;
-        self.prev = Some(cur);
+        let (rel, inliers) = self.estimate_relative(&cur);
+        // world_from_cur = world_from_keyframe * keyframe_from_cur
+        self.world_from_cam = self.world_from_keyframe * rel;
+        self.last_rel = rel;
+
+        // Promote a new keyframe when we've moved far from the current one or
+        // lost support — bounding both motion magnitude and overlap loss.
+        let moved = rel.translation.length();
+        let rotated = Quat::from_mat3a(&rel.matrix3)
+            .normalize()
+            .angle_between(Quat::IDENTITY);
+        if moved > self.keyframe_max_trans
+            || rotated > self.keyframe_max_rot
+            || inliers < self.min_inliers
+        {
+            self.keyframe = Some(cur);
+            self.world_from_keyframe = self.world_from_cam;
+            self.last_rel = Affine3A::IDENTITY;
+        }
         self.world_from_cam
     }
 
-    /// Estimate `prev_from_cur` aligning the current frame onto the previous one
-    /// (projective association + point-to-plane Gauss-Newton).
-    fn estimate_relative(&self, cur: &RefFrame) -> Affine3A {
-        let prev = self.prev.as_ref().unwrap();
+    /// Estimate `keyframe_from_cur` aligning the current frame onto the keyframe
+    /// (projective association + point-to-plane Gauss-Newton). Returns the pose
+    /// and the final inlier count. Warm-started from the last estimate.
+    fn estimate_relative(&self, cur: &RefFrame) -> (Affine3A, usize) {
+        let prev = self.keyframe.as_ref().unwrap();
         let (fx, fy, cx, cy) = (self.intr.fx, self.intr.fy, self.intr.cx, self.intr.cy);
         let (pw, ph) = (prev.width, prev.height);
-        let mut t = Affine3A::IDENTITY;
+        let mut t = self.last_rel;
+        let mut last_count = 0usize;
         for _ in 0..self.max_iters {
             let mut ata = [[0.0f64; 6]; 6];
             let mut atb = [0.0f64; 6];
@@ -266,6 +302,7 @@ impl RgbdVoTracker {
                 }
                 v += self.stride;
             }
+            last_count = count;
             if count < 50 {
                 break;
             }
@@ -281,7 +318,7 @@ impl RgbdVoTracker {
                 break;
             }
         }
-        t
+        (t, last_count)
     }
 }
 
